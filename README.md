@@ -69,10 +69,22 @@ it does not expire while the app runs. Setting a different
 Create a Cloudflare API token with **Workers AI: Read** and note your account
 ID. Clef's free tier (10,000 Neurons/day) covers a typical personal account.
 
-Clef uses Cloudflare's own request format, not the OpenAI one. Behind
-[LiteLLM](https://docs.litellm.ai), add a pass-through endpoint to
-`https://api.cloudflare.com/client/v4/accounts/<id>/ai/run` and point
-`CLEF_URL` at it instead.
+**Through [LiteLLM](https://docs.litellm.ai) (v1.104.2 or newer)** instead of
+calling Cloudflare directly: add Clef to the model list and use LiteLLM's
+System One route, so one virtual key (with its budget and spend tracking)
+covers both Clef and the LLM:
+
+```yaml
+model_list:
+  - model_name: clef
+    litellm_params: {model: cloudflare/@cf/cloudflare/clef, api_key: os.environ/CLOUDFLARE_API_KEY}
+```
+
+```bash
+CLEF_URL=http://litellm:4000/v1/systemone
+CLEF_TOKEN=<virtual key>   # same key as LLM_API_KEY
+CLEF_MODEL=clef            # the model_name above
+```
 
 ### 3. Run
 
@@ -92,9 +104,9 @@ Without Docker: `cargo build --release && ./target/release/socialbtw`.
 | Env | Default | |
 |-----|---------|---|
 | `THREADS_ACCESS_TOKEN` | required | Long-lived Threads token |
-| `CLEF_URL` | required | Clef endpoint (Cloudflare or a pass-through proxy) |
+| `CLEF_URL` | required | Clef endpoint: Cloudflare `.../ai/run/@cf/cloudflare/clef` or LiteLLM `.../v1/systemone` |
 | `CLEF_TOKEN` | required | Bearer token for `CLEF_URL` |
-| `CLEF_MODEL` | `clef` | `clef` (27B, more accurate) or `clef-flash` (9B, cheaper) |
+| `CLEF_MODEL` | `clef` | `clef` (27B, more accurate) or `clef-flash` (9B, cheaper); behind LiteLLM, the `model_name` |
 | `LLM_BASE_URL` | empty | OpenAI-compatible base URL, e.g. `http://litellm:4000/v1`. Empty: uncertain replies go to `review` |
 | `LLM_API_KEY` | empty | API key for the LLM |
 | `LLM_MODEL` | empty | Model name; a small cheap one is enough |
