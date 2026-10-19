@@ -3,11 +3,17 @@
 Hides unwanted replies on your own [Threads](https://www.threads.com) posts.
 
 Every few minutes it reads new top-level replies on your recent posts and
-classifies each one with [Cloudflare Clef](https://developers.cloudflare.com/workers-ai/models/clef/)
-as `hateful`, `harassment`, `spam`, `sexual`, `neutral` or `positive`. Clear
-cases are hidden through the official Threads API. Uncertain cases can go to
-any OpenAI-compatible LLM for a second opinion, or be flagged for you to
-review. Every decision is a JSON log line and a Prometheus metric, so you can
+has a **classifier** rate each one as `hateful`, `harassment`, `spam`,
+`sexual`, `neutral` or `positive`. Clear cases are hidden through the official
+Threads API. Uncertain cases can go to a **reviewer** (any OpenAI-compatible
+chat model) for a second opinion, or be flagged for you to review.
+
+The classifier is pluggable:
+
+| `CLASSIFIER` | Models | |
+|---|---|---|
+| `systemone` (default) | Decision models in the System One format: [Cloudflare Clef](https://developers.cloudflare.com/workers-ai/models/clef/), TypeSafe Jev | Calibrated probabilities in one forward pass; fast and cheap. Directly or through [LiteLLM](https://docs.litellm.ai/docs/decisions) `/v1/systemone` |
+| `chat` | Any OpenAI-compatible chat model: Claude or GPT through LiteLLM, Ollama, vLLM, ... | Asked for JSON probabilities. Slower and costlier; reasoning models can take over a minute per reply | Every decision is a JSON log line and a Prometheus metric, so you can
 alert on it from Grafana or anything else.
 
 Works with Indonesian, English and mixed replies. Spam includes product and
@@ -30,11 +36,11 @@ of memory at runtime.
 ## How a reply is decided
 
 ```
-new reply ──> Clef: probability per category
+new reply ──> classifier: probability per category
                 │
    P(bad) >= HIDE_THRESHOLD ──────────────> hide
-   P(bad) >= REVIEW_THRESHOLD ──> LLM set? ── yes ──> hide / keep / review
-                │                    └─ no ────────> review
+   P(bad) >= REVIEW_THRESHOLD ──> reviewer set? ── yes ──> hide / keep / review
+                │                         └─ no ────────> review
    otherwise ─────────────────────────────> keep
 ```
 
@@ -43,7 +49,7 @@ remembered in the database (a SQLite file, or PostgreSQL with `DATABASE_URL`).
 A reply you unhide by hand is never hidden again.
 
 **Start in dry-run** (the default). Decisions are logged as `would_hide` and
-nothing changes on Threads. Look at the `threads_clef_bad_probability`
+nothing changes on Threads. Look at the `threads_bad_probability`
 histogram and the logs for a few days, tune the thresholds, then set
 `DRY_RUN=false`. Replies seen in dry-run are not revisited afterwards.
 
@@ -77,15 +83,21 @@ browser, so the app can stay private (LAN or VPN); it needs HTTPS. Set
 it does not expire while the app runs. Setting a different
 `THREADS_ACCESS_TOKEN` replaces the stored one.
 
-### 2. Clef
+### 2. Classifier
 
-Create a Cloudflare API token with **Workers AI: Read** and note your account
-ID. Clef's free tier (10,000 Neurons/day) covers a typical personal account.
+**Clef on Cloudflare (default):** create a Cloudflare API token with
+**Workers AI: Read** and note your account ID. Clef's free tier (10,000
+Neurons/day) covers a typical personal account.
 
-**Through [LiteLLM](https://docs.litellm.ai) (v1.104.2 or newer)** instead of
-calling Cloudflare directly: add Clef to the model list and use LiteLLM's
-System One route, so one virtual key (with its budget and spend tracking)
-covers both Clef and the LLM:
+```bash
+CLASSIFIER_URL=https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run/@cf/cloudflare/clef
+CLASSIFIER_TOKEN=<cloudflare token>
+```
+
+**Through [LiteLLM](https://docs.litellm.ai) (v1.104.2 or newer)**: add the
+decision model to the model list and use LiteLLM's System One route, so one
+virtual key (with its budget and spend tracking) covers the classifier and the
+reviewer:
 
 ```yaml
 model_list:
@@ -94,9 +106,18 @@ model_list:
 ```
 
 ```bash
-CLEF_URL=http://litellm:4000/v1/systemone
-CLEF_TOKEN=<virtual key>   # same key as LLM_API_KEY
-CLEF_MODEL=clef            # the model_name above
+CLASSIFIER_URL=http://litellm:4000/v1/systemone
+CLASSIFIER_TOKEN=<virtual key>   # same key as LLM_API_KEY
+CLASSIFIER_MODEL=clef            # the model_name above (or jev, clef-flash, ...)
+```
+
+**A chat model** (for example Claude through LiteLLM):
+
+```bash
+CLASSIFIER=chat
+CLASSIFIER_URL=http://litellm:4000/v1   # OpenAI-compatible base URL
+CLASSIFIER_TOKEN=<key>
+CLASSIFIER_MODEL=claude-haiku-4-5
 ```
 
 ### 3. Run
@@ -104,8 +125,8 @@ CLEF_MODEL=clef            # the model_name above
 ```bash
 docker run -d --name socialbtw \
   -e THREADS_ACCESS_TOKEN=... \
-  -e CLEF_URL=https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run/@cf/cloudflare/clef \
-  -e CLEF_TOKEN=... \
+  -e CLASSIFIER_URL=https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run/@cf/cloudflare/clef \
+  -e CLASSIFIER_TOKEN=... \
   -v socialbtw:/data -p 9090:9090 \
   ghcr.io/franzramadhan/socialbtw:main
 ```
@@ -121,13 +142,15 @@ Without Docker: `cargo build --release && ./target/release/socialbtw`.
 | `THREADS_APP_SECRET` | empty | Threads app secret |
 | `OAUTH_REDIRECT_URI` | empty | Public or private HTTPS URL that reaches `/oauth/callback`, registered in the app |
 | `THREADS_USERNAME` | empty | Only accept tokens for this account (recommended with OAuth) |
-| `CLEF_URL` | required | Clef endpoint: Cloudflare `.../ai/run/@cf/cloudflare/clef` or LiteLLM `.../v1/systemone` |
-| `CLEF_TOKEN` | required | Bearer token for `CLEF_URL` |
-| `CLEF_MODEL` | `clef` | `clef` (27B, more accurate) or `clef-flash` (9B, cheaper); behind LiteLLM, the `model_name` |
-| `LLM_BASE_URL` | empty | OpenAI-compatible base URL, e.g. `http://litellm:4000/v1`. Empty: uncertain replies go to `review` |
-| `LLM_API_KEY` | empty | API key for the LLM |
-| `LLM_MODEL` | empty | Model name; a small cheap one is enough |
-| `EXTRA_RULES` | empty | Your own policy, appended to the LLM prompt (e.g. `Mild swearing between friends is fine.`) |
+| `CLASSIFIER` | `systemone` | `systemone` (Clef, Jev) or `chat` (OpenAI-compatible chat model) |
+| `CLASSIFIER_URL` | required | `systemone`: the full endpoint, Cloudflare `.../ai/run/@cf/cloudflare/clef` or LiteLLM `.../v1/systemone`. `chat`: the base URL, e.g. `http://litellm:4000/v1` |
+| `CLASSIFIER_TOKEN` | empty | Bearer token for `CLASSIFIER_URL` |
+| `CLASSIFIER_MODEL` | `clef` for `systemone`, required for `chat` | e.g. `clef` (27B, more accurate), `clef-flash` (9B, cheaper), `jev`; behind LiteLLM, the `model_name` |
+| `LLM_BASE_URL` | empty | Reviewer: OpenAI-compatible base URL, e.g. `http://litellm:4000/v1`. Empty: uncertain replies go to `review` |
+| `LLM_API_KEY` | empty | Reviewer API key |
+| `LLM_MODEL` | empty | Reviewer model; a small cheap one is enough |
+| `EXTRA_RULES` | empty | Your own policy, added to the chat prompts (chat classifier and reviewer), e.g. `Mild swearing between friends is fine.` |
+| `HTTP_TIMEOUT_SECONDS` | `120` | Per outbound call; raise it for slow reasoning models |
 | `DRY_RUN` | `true` | `false` to actually hide replies |
 | `HIDE_THRESHOLD` | `0.85` | P(bad) at or above this hides |
 | `REVIEW_THRESHOLD` | `0.5` | P(bad) at or above this escalates |
@@ -148,14 +171,14 @@ Logs are one JSON object per line on stdout, with `ts` in Unix seconds. Each
 decision has `msg=decision`
 plus `reply_id`, `username`, `text`, `category`, `bad_probability`,
 `probabilities`, `action` (`hidden`, `would_hide`, `kept`, `review`), `stage`
-(`clef` or `llm`), `reason` and `permalink`.
+(`classifier` or `reviewer`), `reason` and `permalink`.
 
 | Metric | |
 |--------|---|
 | `threads_replies_total{category,action,stage}` | Decisions |
-| `threads_clef_bad_probability` | Histogram of P(bad), for tuning thresholds |
+| `threads_bad_probability` | Histogram of P(bad), for tuning thresholds |
 | `threads_post_checks_total{result}` | Posts whose replies were read (`checked`) or skipped by `POST_CHECK_SCHEDULE` (`skipped`) |
-| `threads_api_errors_total{endpoint}` | Failed calls: `posts`, `replies`, `hide`, `refresh`, `clef`, `llm` |
+| `threads_api_errors_total{endpoint}` | Failed calls: `posts`, `replies`, `hide`, `refresh`, `oauth`, `classifier`, `reviewer` |
 | `threads_last_poll_success_timestamp_seconds` | Last good poll |
 | `threads_token_expiry_timestamp_seconds` | Token expiry, 0 until the first refresh |
 
@@ -183,7 +206,24 @@ example a VictoriaLogs or Loki query for `action:review`).
 cargo test
 # also against PostgreSQL:
 TEST_DATABASE_URL=postgres://... DATABASE_CA_FILE=ca.crt cargo test
+# also against a chat model:
+TEST_CHAT_URL=http://litellm:4000/v1 TEST_CHAT_MODEL=... TEST_CHAT_KEY=... cargo test live_chat
 ```
+
+Code map (`src/`):
+
+| File | |
+|---|---|
+| `main.rs` | wiring and signal handling |
+| `monitor.rs` | poll loop: which posts and replies, what to do with each |
+| `classifier.rs` | categories, the `Classifier` trait, `systemone` and `chat` backends, thresholds |
+| `reviewer.rs` | second opinion on uncertain replies |
+| `llm.rs` | OpenAI-compatible chat client |
+| `threads.rs` | Threads API: token, posts, replies, hide |
+| `oauth.rs` | token registration from the browser |
+| `server.rs` | `/metrics`, `/oauth/*` |
+| `store.rs` | SQLite or PostgreSQL |
+| `metrics.rs`, `http.rs`, `util.rs` | metrics, outbound HTTP, helpers |
 
 ## License
 
