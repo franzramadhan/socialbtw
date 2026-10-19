@@ -6,11 +6,13 @@
 //! lines and to Prometheus metrics.
 
 use rusqlite::{params, Connection, OptionalExtension};
+use rustls::pki_types::{pem::PemObject, CertificateDer};
+use std::cell::RefCell;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, process, thread};
 
@@ -45,6 +47,7 @@ struct Metrics {
     bad_sum: f64,
     api_errors: BTreeMap<&'static str, u64>,
     last_poll: u64,
+    post_checks: BTreeMap<&'static str, u64>,
     token_expiry: u64,
 }
 
@@ -55,6 +58,7 @@ static METRICS: Mutex<Metrics> = Mutex::new(Metrics {
     bad_sum: 0.0,
     api_errors: BTreeMap::new(),
     last_poll: 0,
+    post_checks: BTreeMap::new(),
     token_expiry: 0,
 });
 
@@ -90,6 +94,10 @@ impl Metrics {
         s += "# TYPE threads_api_errors_total counter\n";
         for (e, v) in &self.api_errors {
             s += &format!("threads_api_errors_total{{endpoint=\"{e}\"}} {v}\n");
+        }
+        s += "# TYPE threads_post_checks_total counter\n";
+        for (r, v) in &self.post_checks {
+            s += &format!("threads_post_checks_total{{result=\"{r}\"}} {v}\n");
         }
         s += &format!(
             "# TYPE threads_last_poll_success_timestamp_seconds gauge\nthreads_last_poll_success_timestamp_seconds {}\n\
@@ -276,6 +284,48 @@ fn parsed<T: std::str::FromStr>(name: &str, default: &str) -> T {
     var(name, Some(default)).parse().unwrap_or_else(|_| fatal(&format!("invalid {name}")))
 }
 
+/// Threads timestamp ("2026-10-19T09:19:56+0000") to Unix seconds.
+// ponytail: ignores the offset; Threads always answers in UTC (+0000).
+fn parse_ts(s: &str) -> Option<u64> {
+    let n = |a: usize, b: usize| -> Option<i64> { s.get(a..b)?.parse().ok() };
+    let (y, m, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
+    // days from civil date (Howard Hinnant's algorithm)
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    u64::try_from(days * 86400 + n(11, 13)? * 3600 + n(14, 16)? * 60 + n(17, 19)?).ok()
+}
+
+fn duration(s: &str) -> Option<u64> {
+    let (n, unit) = s.split_at(s.len().checked_sub(1)?);
+    let unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => return None,
+    };
+    Some(n.parse::<u64>().ok()? * unit)
+}
+
+/// "1d:5m,7d:1h,30d:6h" -> [(max age, check interval)], sorted by age.
+fn parse_schedule(spec: &str) -> Option<Vec<(u64, u64)>> {
+    let mut tiers = spec
+        .split(',')
+        .map(|t| t.trim().split_once(':').and_then(|(a, i)| Some((duration(a)?, duration(i)?))))
+        .collect::<Option<Vec<_>>>()?;
+    tiers.sort();
+    (!tiers.is_empty()).then_some(tiers)
+}
+
+/// How long to wait before checking a post again, from the age of its last
+/// activity (the post or its newest reply). Older than every tier: the last one.
+fn check_every(tiers: &[(u64, u64)], age: u64) -> u64 {
+    tiers.iter().find(|(max_age, _)| age < *max_age).or(tiers.last()).map_or(0, |(_, every)| *every)
+}
+
 fn csv_set(name: &str) -> HashSet<String> {
     var(name, Some(""))
         .split(',')
@@ -387,12 +437,77 @@ fn parse_llm(content: &str) -> (String, String) {
 
 // ---- state ------------------------------------------------------------------
 
-/// SQLite: processed replies (so each is classified once) and the refreshed token.
-struct Store(Connection);
+/// One decided reply, as stored.
+struct Decision<'a> {
+    id: &'a str,
+    post_id: &'a str,
+    username: &'a str,
+    text: &'a str,
+    category: &'a str,
+    bad_p: f64,
+    action: &'a str,
+    stage: &'a str,
+    reason: &'a str,
+}
+
+/// Processed replies (so each is classified once) and the current token.
+/// SQLite file by default; PostgreSQL when DATABASE_URL is set, so the app keeps
+/// no local state.
+enum Store {
+    Sqlite(Connection),
+    Postgres { url: String, tls: tokio_postgres_rustls::MakeRustlsConnect, client: RefCell<Option<postgres::Client>> },
+}
+
+const PG_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS replies (
+     id TEXT PRIMARY KEY, post_id TEXT, username TEXT, text TEXT,
+     category TEXT, bad_probability DOUBLE PRECISION, action TEXT, stage TEXT,
+     reason TEXT, decided_at BIGINT);
+ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);";
+
+/// DATABASE_URL if set, else the SQLite file DB_PATH.
+fn db_spec() -> String {
+    let url = var("DATABASE_URL", Some(""));
+    if url.is_empty() { var("DB_PATH", Some("socialbtw.db")) } else { url }
+}
+
+/// TLS for PostgreSQL: the CA in DATABASE_CA_FILE (PEM), else public roots.
+fn pg_tls() -> tokio_postgres_rustls::MakeRustlsConnect {
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = var("DATABASE_CA_FILE", Some(""));
+    if ca.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    } else {
+        for cert in CertificateDer::pem_file_iter(&ca).unwrap_or_else(|e| fatal(&format!("DATABASE_CA_FILE {ca}: {e}"))) {
+            let cert = cert.unwrap_or_else(|e| fatal(&format!("DATABASE_CA_FILE {ca}: {e}")));
+            roots.add(cert).unwrap_or_else(|e| fatal(&format!("DATABASE_CA_FILE {ca}: {e}")));
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap_or_else(|e| fatal(&format!("tls: {e}")))
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tokio_postgres_rustls::MakeRustlsConnect::new(config)
+}
+
+/// postgres::Error's Display is often just "db error"; add the server message
+/// or the underlying cause.
+fn pg_err(e: &postgres::Error) -> String {
+    match (e.as_db_error(), std::error::Error::source(e)) {
+        (Some(db), _) => format!("{e}: {} ({})", db.message(), db.code().code()),
+        (None, Some(src)) => format!("{e}: {src}"),
+        (None, None) => e.to_string(),
+    }
+}
 
 impl Store {
-    fn open(path: &str) -> Self {
-        let db = Connection::open(path).unwrap_or_else(|e| fatal(&format!("open {path}: {e}")));
+    fn open(spec: &str) -> Self {
+        if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
+            // Connects lazily (and again after a failover), so a database that is
+            // still starting does not stop the app.
+            return Store::Postgres { url: spec.into(), tls: pg_tls(), client: RefCell::new(None) };
+        }
+        let db = Connection::open(spec).unwrap_or_else(|e| fatal(&format!("open {spec}: {e}")));
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS replies (
                  id TEXT PRIMARY KEY, post_id TEXT, username TEXT, text TEXT,
@@ -400,23 +515,94 @@ impl Store {
                  reason TEXT, decided_at INTEGER);
              CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);",
         )
-        .unwrap_or_else(|e| fatal(&format!("init {path}: {e}")));
+        .unwrap_or_else(|e| fatal(&format!("init {spec}: {e}")));
         // The poller and the OAuth callback each hold a connection.
         let _ = db.busy_timeout(Duration::from_secs(5));
-        Store(db)
+        Store::Sqlite(db)
     }
 
-    fn seen(&self, id: &str) -> bool {
-        self.0.query_row("SELECT 1 FROM replies WHERE id = ?", [id], |_| Ok(())).optional().ok().flatten().is_some()
+    /// Run `f` on the PostgreSQL client, connecting (and creating the tables) first
+    /// when there is no live connection, and retrying once after a dropped one.
+    fn pg<T>(&self, f: impl Fn(&mut postgres::Client) -> Result<T, postgres::Error>) -> Result<T, String> {
+        let Store::Postgres { url, tls, client } = self else { unreachable!() };
+        let mut slot = client.borrow_mut();
+        for attempt in 0..2 {
+            if slot.as_ref().map_or(true, |c| c.is_closed()) {
+                // The error never contains the URL, so the password stays out of logs.
+                let mut c = postgres::Client::connect(url, tls.clone()).map_err(|e| format!("postgres connect: {}", pg_err(&e)))?;
+                c.batch_execute(PG_SCHEMA).map_err(|e| format!("postgres schema: {}", pg_err(&e)))?;
+                *slot = Some(c);
+            }
+            let c = slot.as_mut().expect("connected above");
+            match f(c) {
+                Ok(v) => return Ok(v),
+                Err(_) if attempt == 0 && c.is_closed() => continue,
+                Err(e) => return Err(format!("postgres: {}", pg_err(&e))),
+            }
+        }
+        Err("postgres: connection lost".into())
+    }
+
+    fn seen(&self, id: &str) -> Result<bool, String> {
+        match self {
+            Store::Sqlite(db) => db
+                .query_row("SELECT 1 FROM replies WHERE id = ?", [id], |_| Ok(()))
+                .optional()
+                .map(|r| r.is_some())
+                .map_err(|e| format!("sqlite: {e}")),
+            Store::Postgres { .. } => self.pg(|c| c.query_opt("SELECT 1 FROM replies WHERE id = $1", &[&id]).map(|r| r.is_some())),
+        }
     }
 
     fn get(&self, key: &str) -> Option<String> {
-        self.0.query_row("SELECT value FROM kv WHERE key = ?", [key], |r| r.get(0)).optional().ok().flatten()
+        let res = match self {
+            Store::Sqlite(db) => db.query_row("SELECT value FROM kv WHERE key = ?", [key], |r| r.get(0)).optional().map_err(|e| format!("sqlite: {e}")),
+            Store::Postgres { .. } => self.pg(|c| c.query_opt("SELECT value FROM kv WHERE key = $1", &[&key]).map(|r| r.map(|r| r.get(0)))),
+        };
+        res.unwrap_or_else(|e| {
+            log(json!({"level": "error", "msg": "store read failed", "error": e}));
+            None
+        })
     }
 
     fn put(&self, key: &str, value: &str) {
-        if let Err(e) = self.0.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", [key, value]) {
-            log(json!({"level": "error", "msg": "store write failed", "error": e.to_string()}));
+        let res = match self {
+            Store::Sqlite(db) => db.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", [key, value]).map(|_| ()).map_err(|e| format!("sqlite: {e}")),
+            Store::Postgres { .. } => self.pg(|c| {
+                c.execute("INSERT INTO kv VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", &[&key, &value])
+                    .map(|_| ())
+            }),
+        };
+        if let Err(e) = res {
+            log(json!({"level": "error", "msg": "store write failed", "error": e}));
+        }
+    }
+
+    fn save(&self, d: &Decision) -> Result<(), String> {
+        let at = now() as i64;
+        match self {
+            Store::Sqlite(db) => db
+                .execute(
+                    "INSERT OR REPLACE INTO replies VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    params![d.id, d.post_id, d.username, d.text, d.category, d.bad_p, d.action, d.stage, d.reason, at],
+                )
+                .map(|_| ())
+                .map_err(|e| format!("sqlite: {e}")),
+            Store::Postgres { .. } => self.pg(|c| {
+                c.execute(
+                    "INSERT INTO replies VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING",
+                    &[&d.id, &d.post_id, &d.username, &d.text, &d.category, &d.bad_p, &d.action, &d.stage, &d.reason, &at],
+                )
+                .map(|_| ())
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn action(&self, id: &str) -> Option<String> {
+        match self {
+            Store::Sqlite(db) => db.query_row("SELECT action FROM replies WHERE id = ?", [id], |r| r.get(0)).optional().ok().flatten(),
+            Store::Postgres { .. } => self.pg(|c| c.query_opt("SELECT action FROM replies WHERE id = $1", &[&id]).map(|r| r.map(|r| r.get(0)))).ok().flatten(),
         }
     }
 }
@@ -442,13 +628,17 @@ struct Monitor {
     llm_key: String,
     llm_model: String,
     next_refresh: u64,
+    schedule: Vec<(u64, u64)>,
+    // ponytail: in memory; after a restart every post is checked once, then backs off again
+    next_check: HashMap<String, u64>,
+    last_activity: HashMap<String, u64>,
 }
 
 impl Monitor {
     fn from_env(http: Http) -> Self {
         let m = Monitor {
             http,
-            store: Store::open(&var("DB_PATH", Some("socialbtw.db"))),
+            store: Store::open(&db_spec()),
             dry_run: var("DRY_RUN", Some("true")).to_lowercase() != "false",
             interval: parsed("POLL_INTERVAL_SECONDS", "300"),
             lookback: parsed::<u64>("LOOKBACK_DAYS", "3") * 86400,
@@ -465,6 +655,10 @@ impl Monitor {
             llm_key: var("LLM_API_KEY", Some("")),
             llm_model: var("LLM_MODEL", Some("")),
             next_refresh: 0,
+            schedule: parse_schedule(&var("POST_CHECK_SCHEDULE", Some("1d:5m,7d:1h,30d:6h")))
+                .unwrap_or_else(|| fatal("invalid POST_CHECK_SCHEDULE, expected like 1d:5m,7d:1h,30d:6h")),
+            next_check: HashMap::new(),
+            last_activity: HashMap::new(),
         };
         // The token is refreshed daily and persisted, because it expires after 60 days.
         // Changing THREADS_ACCESS_TOKEN replaces the stored token. It is optional
@@ -592,13 +786,7 @@ impl Monitor {
         };
 
         let post_id = post["id"].as_str().unwrap_or("");
-        self.store
-            .0
-            .execute(
-                "INSERT OR REPLACE INTO replies VALUES (?,?,?,?,?,?,?,?,?,?)",
-                params![id, post_id, username, text, category, bad_p, action, stage, reason, now() as i64],
-            )
-            .map_err(|e| format!("store: {e}"))?;
+        self.store.save(&Decision { id, post_id, username, text, category: &category, bad_p, action, stage, reason: &reason })?;
         *metrics().replies.entry((category.clone(), action.into(), stage.into())).or_default() += 1;
         log(json!({
             "level": "info", "msg": "decision", "dry_run": self.dry_run,
@@ -610,37 +798,63 @@ impl Monitor {
         Ok(())
     }
 
-    fn poll(&self) -> Result<(), String> {
+    fn poll(&mut self) -> Result<(), String> {
         let since = now().saturating_sub(self.lookback).to_string();
         let posts = self.paged("me/threads", "posts", &[("fields", "id,text,timestamp,topic_tag,media_type"), ("since", &since)])?;
         // Reposts show up in your own feed, but their replies belong to the
         // original author's thread and cannot be hidden by you.
         let own = posts.iter().filter(|p| p["media_type"].as_str() != Some("REPOST_FACADE"));
+        let ids: HashSet<&str> = posts.iter().filter_map(|p| p["id"].as_str()).collect();
+        self.next_check.retain(|id, _| ids.contains(id.as_str()));
+        self.last_activity.retain(|id, _| ids.contains(id.as_str()));
         for post in own.filter(|p| matches_filter(p, &self.topics, &self.hashtags)) {
             let Some(post_id) = post["id"].as_str() else { continue };
+            // Quiet old posts are checked less often (POST_CHECK_SCHEDULE).
+            if now() < self.next_check.get(post_id).copied().unwrap_or(0) {
+                *metrics().post_checks.entry("skipped").or_default() += 1;
+                continue;
+            }
             let replies = self.paged(
                 &format!("{post_id}/replies"),
                 "replies",
                 &[("fields", "id,text,username,permalink,timestamp,hide_status,is_reply_owned_by_me")],
             )?;
+            *metrics().post_checks.entry("checked").or_default() += 1;
+            // A new reply makes an old post "active" again, so it is checked often again.
+            let posted = post["timestamp"].as_str().and_then(parse_ts).unwrap_or_else(now);
+            let active = replies
+                .iter()
+                .filter_map(|r| r["timestamp"].as_str().and_then(parse_ts))
+                .chain([posted, self.last_activity.get(post_id).copied().unwrap_or(0)])
+                .max()
+                .unwrap_or(posted);
+            self.last_activity.insert(post_id.into(), active);
+            let mut failed = false;
             for reply in &replies {
                 // Skip your own replies, allowlisted users, image-only replies, replies already
                 // handled, and anything not in its default state: a reply you unhid by hand
                 // (UNHUSHED) is never hidden again.
                 let username = reply["username"].as_str().unwrap_or("").to_lowercase();
+                let Some(reply_id) = reply["id"].as_str() else { continue };
+                // A database error stops the poll: otherwise every reply would look new
+                // and be paid for again.
                 if reply["is_reply_owned_by_me"].as_bool() == Some(true)
                     || reply["text"].as_str().map_or(true, str::is_empty)
                     || self.allowlist.contains(&username)
                     || reply["hide_status"].as_str().unwrap_or("NOT_HUSHED") != "NOT_HUSHED"
-                    || reply["id"].as_str().map_or(true, |id| self.store.seen(id))
+                    || self.store.seen(reply_id)?
                 {
                     continue;
                 }
                 // One bad reply must not block the rest; it is retried next poll.
                 if let Err(e) = self.handle(post, reply) {
+                    failed = true;
                     log(json!({"level": "error", "msg": "reply failed", "reply_id": reply["id"], "error": e}));
                 }
             }
+            // A failed reply keeps its post on every poll until it goes through.
+            let wait = if failed { 0 } else { check_every(&self.schedule, now().saturating_sub(active)) };
+            self.next_check.insert(post_id.into(), now() + wait);
         }
         Ok(())
     }
@@ -688,7 +902,7 @@ fn main() {
         fatal("set THREADS_ACCESS_TOKEN, or THREADS_APP_ID + THREADS_APP_SECRET + OAUTH_REDIRECT_URI");
     }
     log(json!({"level": "info", "msg": "http", "oauth": oauth.is_some()}));
-    serve(parsed("METRICS_PORT", "9090"), oauth, var("DB_PATH", Some("socialbtw.db")));
+    serve(parsed("METRICS_PORT", "9090"), oauth, db_spec());
     monitor.run();
 }
 
@@ -734,6 +948,21 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_and_schedule() {
+        assert_eq!(parse_ts("2026-10-19T09:19:56+0000"), Some(1_792_401_596));
+        assert_eq!(parse_ts("2024-02-29T23:59:59+0000"), Some(1_709_251_199));
+        assert_eq!(parse_ts("garbage"), None);
+        let tiers = parse_schedule("7d:1h, 1d:5m,30d:6h").unwrap();
+        assert_eq!(tiers, vec![(86400, 300), (604_800, 3600), (2_592_000, 21_600)]);
+        assert_eq!(check_every(&tiers, 3600), 300);
+        assert_eq!(check_every(&tiers, 2 * 86400), 3600);
+        assert_eq!(check_every(&tiers, 20 * 86400), 21_600);
+        assert_eq!(check_every(&tiers, 90 * 86400), 21_600);
+        assert!(parse_schedule("1d:5x").is_none());
+        assert!(parse_schedule("").is_none());
+    }
+
+    #[test]
     fn query_decoding() {
         let p = parse_query("code=AQB%2Fx-y_z&state=ab12&error_description=Permissions+error");
         assert_eq!(p["code"], "AQB/x-y_z");
@@ -765,6 +994,28 @@ mod tests {
         assert!(store.get("expires_at").unwrap().parse::<u64>().unwrap() > now());
     }
 
+    // Needs a PostgreSQL server: TEST_DATABASE_URL=postgres://... (and DATABASE_CA_FILE
+    // for a private CA). Skipped otherwise.
+    #[test]
+    fn postgres_store() {
+        let Ok(url) = env::var("TEST_DATABASE_URL") else { return };
+        let store = Store::open(&url);
+        store.put("k", "v1");
+        store.put("k", "v2");
+        assert_eq!(store.get("k").as_deref(), Some("v2"));
+        let d = Decision { id: "pg-r1", post_id: "p", username: "u", text: "t", category: "spam", bad_p: 0.9, action: "hidden", stage: "clef", reason: "" };
+        store.save(&d).unwrap();
+        store.save(&d).unwrap(); // second save is a no-op
+        assert!(store.seen("pg-r1").unwrap());
+        assert!(!store.seen("pg-nope").unwrap());
+        assert_eq!(store.action("pg-r1").as_deref(), Some("hidden"));
+        // Drop the first connection server-side, as a failover would.
+        Store::open(&url)
+            .pg(|c| c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database()", &[]))
+            .unwrap();
+        assert_eq!(store.get("k").as_deref(), Some("v2"));
+    }
+
     // Runs every handle() case in one test: they share process env vars.
     #[test]
     fn handle_actions() {
@@ -792,7 +1043,7 @@ mod tests {
             }
             let m = Monitor::from_env(http);
             m.handle(&json!({"id": "p1", "text": "post"}), &json!({"id": "r1", "text": "slot gacor", "username": "x"})).unwrap();
-            let action: String = m.store.0.query_row("SELECT action FROM replies WHERE id = 'r1'", [], |r| r.get(0)).unwrap();
+            let action = m.store.action("r1").unwrap();
             let calls = calls.borrow().clone();
             (action, calls)
         };

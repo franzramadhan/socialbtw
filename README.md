@@ -13,7 +13,7 @@ alert on it from Grafana or anything else.
 Works with Indonesian, English and mixed replies (including judi online and
 slot spam).
 
-Written in Rust: one static binary in a 4.4 MB `scratch` image, about 1-2 MiB
+Written in Rust: one static binary in a 5 MB `scratch` image, about 1-2 MiB
 of memory at runtime.
 
 ## What it does not do
@@ -37,7 +37,8 @@ new reply ──> Clef: probability per category
 ```
 
 `P(bad)` is the sum of the four bad categories. Each reply is decided once and
-remembered in SQLite. A reply you unhide by hand is never hidden again.
+remembered in the database (a SQLite file, or PostgreSQL with `DATABASE_URL`).
+A reply you unhide by hand is never hidden again.
 
 **Start in dry-run** (the default). Decisions are logged as `would_hide` and
 nothing changes on Threads. Look at the `threads_clef_bad_probability`
@@ -132,8 +133,11 @@ Without Docker: `cargo build --release && ./target/release/socialbtw`.
 | `HASHTAGS` | empty | Comma-separated hashtags (`#` optional); posts with one of these `#hashtags` in the text are monitored. Case-insensitive. With both `TOPICS` and `HASHTAGS` empty, all posts are monitored; with either set, a post matching either one is monitored |
 | `ALLOWLIST` | empty | Comma-separated usernames never touched |
 | `POLL_INTERVAL_SECONDS` | `300` | |
+| `POST_CHECK_SCHEDULE` | `1d:5m,7d:1h,30d:6h` | How often each post's replies are read, by age of its last activity (the post or its newest reply): under 1 day every 5 min, under 7 days hourly, older every 6 h. Saves Threads API calls on quiet posts; a new reply makes a post "young" again. In memory: after a restart every post is read once |
 | `LOOKBACK_DAYS` | `3` | How far back to read your posts (reposts excluded). Each poll costs 1 call per own post; keep it small if you post a lot |
-| `DB_PATH` | `/data/socialbtw.db` in the image, `socialbtw.db` otherwise | SQLite file. Holds the refreshed token: keep it private |
+| `DB_PATH` | `/data/socialbtw.db` in the image, `socialbtw.db` otherwise | SQLite file, used when `DATABASE_URL` is empty. Holds the refreshed token: keep it private |
+| `DATABASE_URL` | empty | PostgreSQL instead of SQLite, e.g. `postgres://user:pass@host:5432/socialbtw?sslmode=require`. Tables are created on first connect; the connection is re-opened after a failover. Run one instance only |
+| `DATABASE_CA_FILE` | empty | PEM CA for the PostgreSQL server certificate (private CA). Empty: public CA roots. The certificate and hostname are always verified |
 | `METRICS_PORT` | `9090` | HTTP port: `/metrics`, and `/oauth/*` when OAuth is set. Expose only `/oauth/` |
 
 ## Observability
@@ -148,6 +152,7 @@ plus `reply_id`, `username`, `text`, `category`, `bad_probability`,
 |--------|---|
 | `threads_replies_total{category,action,stage}` | Decisions |
 | `threads_clef_bad_probability` | Histogram of P(bad), for tuning thresholds |
+| `threads_post_checks_total{result}` | Posts whose replies were read (`checked`) or skipped by `POST_CHECK_SCHEDULE` (`skipped`) |
 | `threads_api_errors_total{endpoint}` | Failed calls: `posts`, `replies`, `hide`, `refresh`, `clef`, `llm` |
 | `threads_last_poll_success_timestamp_seconds` | Last good poll |
 | `threads_token_expiry_timestamp_seconds` | Token expiry, 0 until the first refresh |
@@ -174,6 +179,8 @@ example a VictoriaLogs or Loki query for `action:review`).
 
 ```bash
 cargo test
+# also against PostgreSQL:
+TEST_DATABASE_URL=postgres://... DATABASE_CA_FILE=ca.crt cargo test
 ```
 
 ## License
