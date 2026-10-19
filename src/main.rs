@@ -22,17 +22,22 @@ const BAD: [&str; 4] = ["hateful", "harassment", "spam", "sexual"];
 const CRITERIA: [(&str, &str); 6] = [
     ("hateful", "attacks a group or identity, slurs, dehumanizing language"),
     ("harassment", "personal attacks, insults, threats or mockery aimed at the post author or another person"),
-    ("spam", "promotion, scams, crypto, links to unrelated sites, follow-for-follow, judi online or slot gambling promotion"),
+    ("spam", "advertising or self-promotion: recommending or naming a product, service, shop, seller or brand with a price, \
+              discount or offer; links, domains or URLs (including obfuscated ones like '(dot)'), referral or affiliate codes and links, \
+              'link in bio' or 'DM me' offers, scams, crypto, follow-for-follow, judi online or slot gambling promotion. \
+              A reply can be friendly and on-topic and still be spam"),
     ("sexual", "unsolicited sexual content or sexual advances"),
-    ("neutral", "on-topic reply, questions, disagreement or criticism without abuse"),
-    ("positive", "supportive, thoughtful or adds value to the conversation"),
+    ("neutral", "on-topic reply, questions, disagreement or criticism without abuse and without promoting anything"),
+    ("positive", "supportive, thoughtful or adds value to the conversation, without promoting a product, seller or link"),
 ];
 
 const LLM_PROMPT: &str = "You moderate replies on the author's own Threads posts.
 Replies may be in Indonesian, English, or a mix, and may use slang.
-Hide replies that are hateful, harassment, spam (including judi online or slot
-promotion), or unsolicited sexual content. Keep criticism, disagreement, and
-friendly jokes. {extra}
+Hide replies that are hateful, harassment, spam, or unsolicited sexual content.
+Spam includes product or service promotion (a shop, seller or brand with a price
+or offer, even when friendly and on-topic), links or domains (also obfuscated,
+like "(dot)"), referral or affiliate codes, and judi online or slot promotion.
+Keep criticism, disagreement, and friendly jokes. {extra}
 Answer with JSON only: {\"action\": \"hide\" | \"keep\" | \"review\", \"reason\": \"<one short sentence>\"}.
 Use \"review\" only when you truly cannot decide.";
 

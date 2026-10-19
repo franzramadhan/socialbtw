@@ -10,8 +10,10 @@ any OpenAI-compatible LLM for a second opinion, or be flagged for you to
 review. Every decision is a JSON log line and a Prometheus metric, so you can
 alert on it from Grafana or anything else.
 
-Works with Indonesian, English and mixed replies (including judi online and
-slot spam).
+Works with Indonesian, English and mixed replies. Spam includes product and
+service promotion (even friendly, on-topic "use X, only Rp 99.000"), links and
+domains (also obfuscated like "(dot)"), referral codes, and judi online or slot
+promotion.
 
 Written in Rust: one static binary in a 5 MB `scratch` image, about 1-2 MiB
 of memory at runtime.
