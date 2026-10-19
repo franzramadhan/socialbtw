@@ -23,6 +23,7 @@ of memory at runtime.
 - **Nested replies.** Only top-level replies can be hidden; hiding one also
   hides everything under it.
 - **Image-only replies.** Replies without text are skipped.
+- **Reposts.** Replies under a post you reposted belong to its author; reposts are skipped.
 
 ## How a reply is decided
 
@@ -118,7 +119,7 @@ Without Docker: `cargo build --release && ./target/release/socialbtw`.
 | `HASHTAGS` | empty | Comma-separated hashtags (`#` optional); posts with one of these `#hashtags` in the text are monitored. Case-insensitive. With both `TOPICS` and `HASHTAGS` empty, all posts are monitored; with either set, a post matching either one is monitored |
 | `ALLOWLIST` | empty | Comma-separated usernames never touched |
 | `POLL_INTERVAL_SECONDS` | `300` | |
-| `LOOKBACK_DAYS` | `3` | How far back to read your posts. Each poll costs 1 call per post; keep it small if you post a lot |
+| `LOOKBACK_DAYS` | `3` | How far back to read your posts (reposts excluded). Each poll costs 1 call per own post; keep it small if you post a lot |
 | `DB_PATH` | `/data/socialbtw.db` in the image, `socialbtw.db` otherwise | SQLite file. Holds the refreshed token: keep it private |
 | `METRICS_PORT` | `9090` | Prometheus `/metrics` |
 

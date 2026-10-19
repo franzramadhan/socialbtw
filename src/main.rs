@@ -474,8 +474,11 @@ impl Monitor {
 
     fn poll(&self) -> Result<(), String> {
         let since = now().saturating_sub(self.lookback).to_string();
-        let posts = self.paged("me/threads", "posts", &[("fields", "id,text,timestamp,topic_tag"), ("since", &since)])?;
-        for post in posts.iter().filter(|p| matches_filter(p, &self.topics, &self.hashtags)) {
+        let posts = self.paged("me/threads", "posts", &[("fields", "id,text,timestamp,topic_tag,media_type"), ("since", &since)])?;
+        // Reposts show up in your own feed, but their replies belong to the
+        // original author's thread and cannot be hidden by you.
+        let own = posts.iter().filter(|p| p["media_type"].as_str() != Some("REPOST_FACADE"));
+        for post in own.filter(|p| matches_filter(p, &self.topics, &self.hashtags)) {
             let Some(post_id) = post["id"].as_str() else { continue };
             let replies = self.paged(
                 &format!("{post_id}/replies"),
