@@ -36,7 +36,7 @@ Replies may be in Indonesian, English, or a mix, and may use slang.
 Hide replies that are hateful, harassment, spam, or unsolicited sexual content.
 Spam includes product or service promotion (a shop, seller or brand with a price
 or offer, even when friendly and on-topic), links or domains (also obfuscated,
-like "(dot)"), referral or affiliate codes, and judi online or slot promotion.
+like \"(dot)\"), referral or affiliate codes, and judi online or slot promotion.
 Keep criticism, disagreement, and friendly jokes. {extra}
 Answer with JSON only: {\"action\": \"hide\" | \"keep\" | \"review\", \"reason\": \"<one short sentence>\"}.
 Use \"review\" only when you truly cannot decide.";
