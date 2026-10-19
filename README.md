@@ -13,6 +13,9 @@ alert on it from Grafana or anything else.
 Works with Indonesian, English and mixed replies (including judi online and
 slot spam).
 
+Written in Rust: one static binary in a 4.4 MB `scratch` image, about 1-2 MiB
+of memory at runtime.
+
 ## What it does not do
 
 - **Block users or like replies.** The Threads API has no endpoint for either.
@@ -82,7 +85,7 @@ docker run -d --name socialbtw \
   ghcr.io/franzramadhan/socialbtw:main
 ```
 
-Without Docker: `pip install -r requirements.txt && python threads_monitor.py`.
+Without Docker: `cargo build --release && ./target/release/socialbtw`.
 
 ## Configuration
 
@@ -103,12 +106,13 @@ Without Docker: `pip install -r requirements.txt && python threads_monitor.py`.
 | `ALLOWLIST` | empty | Comma-separated usernames never touched |
 | `POLL_INTERVAL_SECONDS` | `300` | |
 | `LOOKBACK_DAYS` | `3` | How far back to read your posts. Each poll costs 1 call per post; keep it small if you post a lot |
-| `DB_PATH` | `/data/threads-monitor.db` in the image | SQLite file. Holds the refreshed token: keep it private |
+| `DB_PATH` | `/data/socialbtw.db` in the image, `socialbtw.db` otherwise | SQLite file. Holds the refreshed token: keep it private |
 | `METRICS_PORT` | `9090` | Prometheus `/metrics` |
 
 ## Observability
 
-Logs are one JSON object per line on stdout. Each decision has `msg=decision`
+Logs are one JSON object per line on stdout, with `ts` in Unix seconds. Each
+decision has `msg=decision`
 plus `reply_id`, `username`, `text`, `category`, `bad_probability`,
 `probabilities`, `action` (`hidden`, `would_hide`, `kept`, `review`), `stage`
 (`clef` or `llm`), `reason` and `permalink`.
@@ -142,8 +146,7 @@ example a VictoriaLogs or Loki query for `action:review`).
 ## Development
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python test_threads_monitor.py
+cargo test
 ```
 
 ## License

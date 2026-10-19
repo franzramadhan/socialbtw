@@ -1,0 +1,19 @@
+[package]
+name = "socialbtw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Hide unwanted replies on your own Threads posts"
+
+[dependencies]
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
