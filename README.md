@@ -59,6 +59,15 @@ or its newest reply):
 A new reply makes a post count as fresh again. Change the tiers with
 `POST_CHECK_SCHEDULE` (default `1d:5m,7d:1h,30d:6h`).
 
+**If you post a lot:** at most `MAX_POSTS_PER_POLL` (50) posts are read per
+poll, most overdue first; the rest wait for the next poll. Lists are fetched
+100 items per page.
+
+**Rate limits** (HTTP 429, or Meta error codes 4, 17, 32, 613) pause polling
+for 15 minutes, doubling while they continue, up to 6 hours. A hide that fails
+is saved as `hide_pending` and retried on its own, without classifying the
+reply again. If the reply is gone (another 4xx), it becomes `hide_failed`.
+
 ## Setup
 
 **1. Meta app.** At <https://developers.facebook.com/apps>, create an app with
@@ -137,6 +146,8 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 | `TOPICS` | | Only posts with one of these Threads topics (comma-separated) |
 | `HASHTAGS` | | Only posts with one of these `#hashtags`. With `TOPICS`, either one matches |
 | `ALLOWLIST` | | Usernames never touched |
+| `MAX_POSTS_PER_POLL` | `50` | Posts whose replies are read per poll; 0 for no cap |
+| `RATE_LIMIT_BACKOFF`, `RATE_LIMIT_MAX_BACKOFF` | `15m`, `6h` | First and longest pause after a rate limit |
 | **Storage and runtime** | | |
 | `DATABASE_URL` | | PostgreSQL (`postgres://...?sslmode=require`) instead of SQLite. One instance only |
 | `DATABASE_CA_FILE` | | PEM CA for a private PostgreSQL certificate |
@@ -147,22 +158,24 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 ## Observability
 
 Each decision is a JSON log line (`msg=decision`) with the reply, `category`,
-`bad_probability`, `action` (`hidden`, `would_hide`, `kept`, `review`),
+`bad_probability`, `action` (`hidden`, `would_hide`, `kept`, `review`,
+`hide_pending`, `hide_failed`),
 `stage` (`classifier` or `reviewer`), `reason` and `permalink`.
 
 | Metric | |
 |---|---|
 | `threads_replies_total{category,action,stage}` | Decisions |
 | `threads_bad_probability` | Histogram of P(bad), for tuning thresholds |
-| `threads_post_checks_total{result}` | Posts read (`checked`) or skipped by the schedule |
+| `threads_post_checks_total{result}` | Posts read (`checked`), not due (`skipped`) or left for the next poll (`over_budget`) |
 | `threads_api_errors_total{endpoint}` | Failed calls |
 | `threads_last_poll_success_timestamp_seconds` | Last good poll |
 | `threads_token_expiry_timestamp_seconds` | Token expiry |
+| `threads_rate_limited_until_timestamp_seconds` | End of the current rate-limit pause |
 
 Useful alerts: `increase(threads_replies_total{action="review"}[15m]) > 0`
 (needs you), `time() - threads_last_poll_success_timestamp_seconds > 1800`
 (stuck), `threads_token_expiry_timestamp_seconds - time() < 7*86400` (refresh
-failing). For the reply text in a notification, alert on the logs instead.
+failing), `threads_rate_limited_until_timestamp_seconds > time()` (paused). For the reply text in a notification, alert on the logs instead.
 
 ## Development
 

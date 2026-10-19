@@ -23,6 +23,21 @@ pub struct Decision<'a> {
     pub reason: &'a str,
 }
 
+/// A reply decided "hide" whose hide call has not gone through yet.
+pub struct PendingHide {
+    pub id: String,
+    pub post_id: String,
+    pub username: String,
+    pub text: String,
+    pub category: String,
+    pub bad_p: f64,
+    pub stage: String,
+    pub reason: String,
+}
+
+const PENDING_SQL: &str = "SELECT id, post_id, username, text, category, bad_probability, stage, reason \
+                           FROM replies WHERE action = 'hide_pending' ORDER BY decided_at";
+
 pub enum Store {
     Sqlite(Connection),
     Postgres { url: String, tls: tokio_postgres_rustls::MakeRustlsConnect, client: RefCell<Option<postgres::Client>> },
@@ -167,6 +182,50 @@ impl Store {
         }
     }
 
+    pub fn pending_hides(&self) -> Result<Vec<PendingHide>, String> {
+        match self {
+            Store::Sqlite(db) => {
+                let mut stmt = db.prepare(PENDING_SQL).map_err(|e| format!("sqlite: {e}"))?;
+                let rows = stmt.query_map([], |r| {
+                    Ok(PendingHide {
+                        id: r.get(0)?,
+                        post_id: r.get(1)?,
+                        username: r.get(2)?,
+                        text: r.get(3)?,
+                        category: r.get(4)?,
+                        bad_p: r.get(5)?,
+                        stage: r.get(6)?,
+                        reason: r.get(7)?,
+                    })
+                });
+                rows.and_then(|rows| rows.collect()).map_err(|e| format!("sqlite: {e}"))
+            }
+            Store::Postgres { .. } => self.pg(|c| {
+                c.query(PENDING_SQL, &[]).map(|rows| {
+                    rows.iter()
+                        .map(|r| PendingHide {
+                            id: r.get(0),
+                            post_id: r.get(1),
+                            username: r.get(2),
+                            text: r.get(3),
+                            category: r.get(4),
+                            bad_p: r.get(5),
+                            stage: r.get(6),
+                            reason: r.get(7),
+                        })
+                        .collect()
+                })
+            }),
+        }
+    }
+
+    pub fn set_action(&self, id: &str, action: &str) -> Result<(), String> {
+        match self {
+            Store::Sqlite(db) => db.execute("UPDATE replies SET action = ? WHERE id = ?", [action, id]).map(|_| ()).map_err(|e| format!("sqlite: {e}")),
+            Store::Postgres { .. } => self.pg(|c| c.execute("UPDATE replies SET action = $1 WHERE id = $2", &[&action, &id]).map(|_| ())),
+        }
+    }
+
     #[cfg(test)]
     pub fn action(&self, id: &str) -> Option<String> {
         match self {
@@ -191,6 +250,12 @@ mod tests {
         assert!(store.seen("r1").unwrap());
         assert!(!store.seen("nope").unwrap());
         assert_eq!(store.action("r1").as_deref(), Some("hidden"));
+        let pending = Decision { id: "r2", action: "hide_pending", ..d };
+        store.save(&pending).unwrap();
+        let p = store.pending_hides().unwrap();
+        assert_eq!((p.len(), p[0].id.as_str(), p[0].category.as_str()), (1, "r2", "spam"));
+        store.set_action("r2", "hidden").unwrap();
+        assert!(store.pending_hides().unwrap().is_empty());
     }
 
     // Needs a PostgreSQL server: TEST_DATABASE_URL=postgres://... (and DATABASE_CA_FILE
@@ -208,6 +273,10 @@ mod tests {
         assert!(store.seen("pg-r1").unwrap());
         assert!(!store.seen("pg-nope").unwrap());
         assert_eq!(store.action("pg-r1").as_deref(), Some("hidden"));
+        store.save(&Decision { id: "pg-r2", action: "hide_pending", ..d }).unwrap();
+        assert!(store.pending_hides().unwrap().iter().any(|p| p.id == "pg-r2"));
+        store.set_action("pg-r2", "hidden").unwrap();
+        assert!(!store.pending_hides().unwrap().iter().any(|p| p.id == "pg-r2"));
         // Drop the first connection server-side, as a failover would.
         Store::open(&url)
             .pg(|c| c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database()", &[]))

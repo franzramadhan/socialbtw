@@ -2,7 +2,7 @@
 //! with each one.
 
 use crate::classifier::{self, decide, Classifier, Input};
-use crate::http::Http;
+use crate::http::{is_client_error, is_rate_limited, Http};
 use crate::metrics::metrics;
 use crate::reviewer::Reviewer;
 use crate::store::{db_spec, Decision, Store};
@@ -27,6 +27,12 @@ pub struct Monitor {
     topics: HashSet<String>,
     hashtags: HashSet<String>,
     schedule: Vec<(u64, u64)>,
+    max_posts_per_poll: usize,
+    min_backoff: u64,
+    max_backoff: u64,
+    /// Current pause after rate limits (0: none); doubles while they continue.
+    backoff: u64,
+    paused_until: u64,
     next_refresh: u64,
     // ponytail: in memory; after a restart every post is checked once, then backs off again
     next_check: HashMap<String, u64>,
@@ -51,6 +57,11 @@ impl Monitor {
             hashtags: csv_set("HASHTAGS"),
             schedule: parse_schedule(&var("POST_CHECK_SCHEDULE", Some("1d:5m,7d:1h,30d:6h")))
                 .unwrap_or_else(|| fatal("invalid POST_CHECK_SCHEDULE, expected like 1d:5m,7d:1h,30d:6h")),
+            max_posts_per_poll: parsed("MAX_POSTS_PER_POLL", "50"),
+            min_backoff: duration(&var("RATE_LIMIT_BACKOFF", Some("15m"))).unwrap_or_else(|| fatal("invalid RATE_LIMIT_BACKOFF, expected like 15m")),
+            max_backoff: duration(&var("RATE_LIMIT_MAX_BACKOFF", Some("6h"))).unwrap_or_else(|| fatal("invalid RATE_LIMIT_MAX_BACKOFF, expected like 6h")),
+            backoff: 0,
+            paused_until: 0,
             next_refresh: 0,
             next_check: HashMap::new(),
             last_activity: HashMap::new(),
@@ -82,12 +93,18 @@ impl Monitor {
                 None => action = "review".into(),
             }
         }
+        // A failed hide is saved as hide_pending and retried on its own
+        // (retry_pending_hides), so the reply is not classified and paid for again.
+        let mut hide_error = None;
         let action = match action.as_str() {
             "hide" if self.dry_run => "would_hide",
-            "hide" => {
-                self.threads().hide(id)?;
-                "hidden"
-            }
+            "hide" => match self.threads().hide(id) {
+                Ok(()) => "hidden",
+                Err(e) => {
+                    hide_error = Some(e);
+                    "hide_pending"
+                }
+            },
             "keep" => "kept",
             _ => "review",
         };
@@ -102,24 +119,66 @@ impl Monitor {
             "probabilities": probs, "action": action, "stage": stage, "reason": reason,
             "permalink": reply["permalink"].as_str().unwrap_or(""),
         }));
+        match hide_error {
+            // Stops the poll, so the backoff starts.
+            Some(e) if is_rate_limited(&e) => Err(e),
+            Some(e) => {
+                log(json!({"level": "warning", "msg": "hide failed, will retry", "reply_id": id, "error": e}));
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Retry hides that failed earlier. A rate limit stops here; a 4xx (the reply
+    /// is gone, for example) gives up as hide_failed; anything else stays pending.
+    fn retry_pending_hides(&self) -> Result<(), String> {
+        if self.dry_run {
+            return Ok(());
+        }
+        for p in self.store.pending_hides()? {
+            let action = match self.threads().hide(&p.id) {
+                Ok(()) => "hidden",
+                Err(e) if is_rate_limited(&e) => return Err(e),
+                Err(e) if is_client_error(&e) => {
+                    log(json!({"level": "error", "msg": "hide failed for good", "reply_id": p.id, "error": e}));
+                    "hide_failed"
+                }
+                Err(e) => {
+                    log(json!({"level": "warning", "msg": "hide failed, will retry", "reply_id": p.id, "error": e}));
+                    continue;
+                }
+            };
+            self.store.set_action(&p.id, action)?;
+            *metrics().replies.entry((p.category.clone(), action.into(), p.stage.clone())).or_default() += 1;
+            log(json!({
+                "level": "info", "msg": "decision", "dry_run": false, "retried": true,
+                "reply_id": p.id, "post_id": p.post_id, "username": p.username, "text": p.text,
+                "category": p.category, "bad_probability": (p.bad_p * 10000.0).round() / 10000.0,
+                "action": action, "stage": p.stage, "reason": p.reason, "permalink": "",
+            }));
+        }
         Ok(())
     }
 
     fn poll(&mut self) -> Result<(), String> {
+        self.retry_pending_hides()?;
         let posts = self.threads().posts(now().saturating_sub(self.lookback))?;
         let ids: HashSet<&str> = posts.iter().filter_map(|p| p["id"].as_str()).collect();
         self.next_check.retain(|id, _| ids.contains(id.as_str()));
         self.last_activity.retain(|id, _| ids.contains(id.as_str()));
         // Reposts show up in your own feed, but their replies belong to the
         // original author's thread and cannot be hidden by you.
-        let own = posts.iter().filter(|p| p["media_type"].as_str() != Some("REPOST_FACADE"));
-        for post in own.filter(|p| matches_filter(p, &self.topics, &self.hashtags)) {
+        let own: Vec<&Value> = posts
+            .iter()
+            .filter(|p| p["media_type"].as_str() != Some("REPOST_FACADE"))
+            .filter(|p| matches_filter(p, &self.topics, &self.hashtags))
+            .collect();
+        let (due, not_due, over_budget) = select_due(own, &self.next_check, now(), self.max_posts_per_poll);
+        *metrics().post_checks.entry("skipped").or_default() += not_due as u64;
+        *metrics().post_checks.entry("over_budget").or_default() += over_budget as u64;
+        for post in due {
             let Some(post_id) = post["id"].as_str() else { continue };
-            // Quiet old posts are checked less often (POST_CHECK_SCHEDULE).
-            if now() < self.next_check.get(post_id).copied().unwrap_or(0) {
-                *metrics().post_checks.entry("skipped").or_default() += 1;
-                continue;
-            }
             let replies = self.threads().replies(post_id)?;
             *metrics().post_checks.entry("checked").or_default() += 1;
             // A new reply makes an old post "active" again, so it is checked often again.
@@ -149,7 +208,11 @@ impl Monitor {
                     continue;
                 }
                 // One bad reply must not block the rest; it is retried next poll.
+                // A rate limit stops the whole poll.
                 if let Err(e) = self.handle(post, reply) {
+                    if is_rate_limited(&e) {
+                        return Err(e);
+                    }
                     failed = true;
                     log(json!({"level": "error", "msg": "reply failed", "reply_id": reply["id"], "error": e}));
                 }
@@ -173,6 +236,10 @@ impl Monitor {
             "classifier": var("CLASSIFIER", Some("systemone")), "reviewer": self.reviewer.is_some(),
         }));
         loop {
+            if now() < self.paused_until {
+                thread::sleep(Duration::from_secs(self.interval.min(self.paused_until.saturating_sub(now())).max(1)));
+                continue;
+            }
             if self.threads().token().is_empty() {
                 log(json!({"level": "warning", "msg": "no Threads token: set THREADS_ACCESS_TOKEN or open /oauth/start"}));
                 thread::sleep(Duration::from_secs(self.interval));
@@ -183,7 +250,16 @@ impl Monitor {
                 self.threads().refresh();
             }
             match self.poll() {
-                Ok(()) => metrics().last_poll = now(),
+                Ok(()) => {
+                    metrics().last_poll = now();
+                    self.backoff = 0;
+                }
+                Err(e) if is_rate_limited(&e) => {
+                    self.backoff = next_backoff(self.backoff, self.min_backoff, self.max_backoff);
+                    self.paused_until = now() + self.backoff;
+                    metrics().paused_until = self.paused_until;
+                    log(json!({"level": "warning", "msg": "rate limited, pausing", "seconds": self.backoff, "until": self.paused_until, "error": e}));
+                }
                 Err(e) => log(json!({"level": "error", "msg": "poll failed", "error": e})),
             }
             thread::sleep(Duration::from_secs(self.interval));
@@ -206,6 +282,25 @@ fn matches_filter(post: &Value, topics: &HashSet<String>, hashtags: &HashSet<Str
         .skip(1)
         .map(|s| s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>().to_lowercase())
         .any(|t| hashtags.contains(&t))
+}
+
+/// Posts whose check is due, most overdue first (never checked = first), capped
+/// at `budget` (0: no cap). Also returns how many were not due and how many
+/// were due but over the budget; those stay due for the next poll.
+fn select_due<'a>(posts: Vec<&'a Value>, next_check: &HashMap<String, u64>, now: u64, budget: usize) -> (Vec<&'a Value>, usize, usize) {
+    let due_at = |p: &Value| p["id"].as_str().and_then(|id| next_check.get(id)).copied().unwrap_or(0);
+    let total = posts.len();
+    let mut due: Vec<&Value> = posts.into_iter().filter(|p| due_at(p) <= now).collect();
+    let not_due = total - due.len();
+    due.sort_by_key(|p| due_at(p));
+    let over = if budget > 0 && due.len() > budget { due.len() - budget } else { 0 };
+    due.truncate(due.len() - over);
+    (due, not_due, over)
+}
+
+/// The next pause after a rate limit: the minimum first, then doubling, capped.
+fn next_backoff(current: u64, min: u64, max: u64) -> u64 {
+    (current * 2).clamp(min, max)
 }
 
 /// "1d:5m,7d:1h,30d:6h" -> [(max age, check interval)], sorted by age.
@@ -256,14 +351,36 @@ mod tests {
         assert!(parse_schedule("").is_none());
     }
 
+    #[test]
+    fn due_posts_and_backoff() {
+        let posts = [json!({"id": "a"}), json!({"id": "b"}), json!({"id": "c"}), json!({"id": "d"})];
+        let next: HashMap<String, u64> = [("a", 50), ("b", 10), ("c", 500)].iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let ids = |v: Vec<&Value>| v.iter().map(|p| p["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // c is not due; d was never checked so it goes first, then the most overdue.
+        let (due, not_due, over) = select_due(posts.iter().collect(), &next, 100, 0);
+        assert_eq!((ids(due), not_due, over), (vec!["d".to_string(), "b".into(), "a".into()], 1, 0));
+        let (due, _, over) = select_due(posts.iter().collect(), &next, 100, 2);
+        assert_eq!((ids(due), over), (vec!["d".to_string(), "b".into()], 1));
+        assert_eq!(next_backoff(0, 900, 21_600), 900);
+        assert_eq!(next_backoff(900, 900, 21_600), 1800);
+        assert_eq!(next_backoff(14_400, 900, 21_600), 21_600);
+    }
+
     // Runs every handle() case in one test: they share process env vars.
     #[test]
     fn handle_actions() {
-        let run = |dry_run: bool, probs: Value, verdict: Option<&str>| -> (String, Vec<&'static str>) {
+        let setup = |dry_run: bool, probs: Value, verdict: Option<&str>, hide_err: Option<&'static str>| -> (Monitor, Rc<RefCell<Vec<&'static str>>>) {
             let calls = Rc::new(RefCell::new(Vec::new()));
             let (c, verdict_text) = (calls.clone(), verdict.map(String::from));
+            // The first hide call fails with `hide_err`, later ones succeed.
+            let failed_once = Rc::new(RefCell::new(false));
             let http: Http = Box::new(move |endpoint, _, _, _, _| {
                 c.borrow_mut().push(endpoint);
+                let already_failed = *failed_once.borrow();
+                if let (Some(e), "hide", false) = (hide_err, endpoint, already_failed) {
+                    *failed_once.borrow_mut() = true;
+                    return Err(e.into());
+                }
                 Ok(match endpoint {
                     "classifier" => json!({"result": {"answers": {"category": {"probabilities": probs}}}}),
                     "reviewer" => json!({"choices": [{"message": {"content": verdict_text.clone().unwrap_or_default()}}]}),
@@ -281,8 +398,13 @@ mod tests {
             ] {
                 env::set_var(k, v);
             }
-            let m = Monitor::from_env(http);
-            m.handle(&json!({"id": "p1", "text": "post"}), &json!({"id": "r1", "text": "slot gacor", "username": "x"})).unwrap();
+            (Monitor::from_env(http), calls)
+        };
+        let post = json!({"id": "p1", "text": "post"});
+        let reply = json!({"id": "r1", "text": "slot gacor", "username": "x"});
+        let run = |dry_run: bool, probs: Value, verdict: Option<&str>| -> (String, Vec<&'static str>) {
+            let (m, calls) = setup(dry_run, probs, verdict, None);
+            m.handle(&post, &reply).unwrap();
             let action = m.store.action("r1").unwrap();
             let calls = calls.borrow().clone();
             (action, calls)
@@ -296,5 +418,24 @@ mod tests {
             ("hidden".into(), vec!["classifier", "reviewer", "hide"])
         );
         assert_eq!(run(false, gray, Some("no idea")), ("review".into(), vec!["classifier", "reviewer"]));
+
+        // Rate-limited hide: saved as hide_pending, the poll is stopped, and the
+        // retry hides it without classifying again.
+        let (m, calls) = setup(false, json!({"spam": 0.99}), None, Some("hide: rate limited (HTTP 429): "));
+        assert!(is_rate_limited(&m.handle(&post, &reply).unwrap_err()));
+        assert_eq!(m.store.action("r1").as_deref(), Some("hide_pending"));
+        m.retry_pending_hides().unwrap();
+        assert_eq!(m.store.action("r1").as_deref(), Some("hidden"));
+        assert_eq!(*calls.borrow(), vec!["classifier", "hide", "hide"]);
+
+        // The reply is gone (4xx): the retry gives up as hide_failed.
+        let (m, _) = setup(false, json!({"spam": 0.99}), None, Some("hide: HTTP 500: busy"));
+        m.handle(&post, &reply).unwrap(); // not a rate limit: the poll goes on
+        assert_eq!(m.store.action("r1").as_deref(), Some("hide_pending"));
+        m.store.set_action("r1", "hide_pending").unwrap();
+        let gone: Http = Box::new(|_, _, _, _, _| Err("hide: HTTP 400: {\"error\":{\"code\":100}}".into()));
+        let m = Monitor { http: gone, ..m };
+        m.retry_pending_hides().unwrap();
+        assert_eq!(m.store.action("r1").as_deref(), Some("hide_failed"));
     }
 }

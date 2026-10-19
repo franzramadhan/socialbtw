@@ -5,6 +5,33 @@ use crate::util::parsed;
 use serde_json::Value;
 use std::time::Duration;
 
+/// Marker in errors from rate-limited calls; see `is_rate_limited`.
+const RATE_LIMITED: &str = "rate limited";
+
+/// Meta error codes for rate limits: app (4), user (17), page (32), API
+/// call limit (613).
+const META_RATE_LIMIT_CODES: [i64; 4] = [4, 17, 32, 613];
+
+pub fn is_rate_limited(err: &str) -> bool {
+    err.contains(RATE_LIMITED)
+}
+
+/// A 4xx answer that is not a rate limit: retrying the same call will not help.
+pub fn is_client_error(err: &str) -> bool {
+    !is_rate_limited(err) && err.contains(": HTTP 4")
+}
+
+/// Error text for an HTTP error status, marked when it is a rate limit.
+fn status_error(endpoint: &str, code: u16, body: &str) -> String {
+    let meta_code = serde_json::from_str::<Value>(body).ok().and_then(|v| v["error"]["code"].as_i64());
+    let text: String = body.chars().take(500).collect();
+    if code == 429 || meta_code.is_some_and(|c| META_RATE_LIMIT_CODES.contains(&c)) {
+        format!("{endpoint}: {RATE_LIMITED} (HTTP {code}): {text}")
+    } else {
+        format!("{endpoint}: HTTP {code}: {text}")
+    }
+}
+
 /// (endpoint label, method, url, bearer token, JSON body) -> JSON response.
 /// The label names the call in errors and in threads_api_errors_total.
 pub type Http = Box<dyn Fn(&'static str, &str, &str, Option<&str>, Option<&Value>) -> Result<Value, String>>;
@@ -24,10 +51,7 @@ pub fn real_http() -> Http {
         // Never format the URL into errors: Threads URLs carry the access token.
         let out = match res {
             Ok(r) => r.into_json::<Value>().map_err(|e| format!("{endpoint}: bad JSON: {e}")),
-            Err(ureq::Error::Status(code, r)) => {
-                let text: String = r.into_string().unwrap_or_default().chars().take(500).collect();
-                Err(format!("{endpoint}: HTTP {code}: {text}"))
-            }
+            Err(ureq::Error::Status(code, r)) => Err(status_error(endpoint, code, &r.into_string().unwrap_or_default())),
             Err(ureq::Error::Transport(t)) => {
                 // The message or the underlying error ("timed out"), but not
                 // Display, which would include the URL.
@@ -46,6 +70,18 @@ pub fn real_http() -> Http {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn rate_limits_are_recognized() {
+        let meta = |c: i64| format!("{{\"error\":{{\"message\":\"limit\",\"code\":{c}}}}}");
+        assert!(is_rate_limited(&status_error("posts", 429, "")));
+        assert!(is_rate_limited(&status_error("posts", 400, &meta(4))));
+        assert!(is_rate_limited(&status_error("hide", 403, &meta(613))));
+        let not_found = status_error("hide", 400, &meta(100));
+        assert!(!is_rate_limited(&not_found) && is_client_error(&not_found));
+        let server = status_error("hide", 500, "oops");
+        assert!(!is_rate_limited(&server) && !is_client_error(&server));
+    }
 
     #[test]
     fn timeout_error_is_readable_and_hides_the_url() {
