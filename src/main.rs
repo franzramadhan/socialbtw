@@ -193,18 +193,21 @@ fn real_http() -> Http {
 
 // ---- decisions --------------------------------------------------------------
 
-/// True when `tags` is empty, or the post's topic tag or a #hashtag in its text is in `tags`.
-fn matches_tags(post: &Value, tags: &HashSet<String>) -> bool {
-    if tags.is_empty() {
+/// True when no filter is set, or the post's topic is in `topics`, or a #hashtag
+/// in its text is in `hashtags`.
+fn matches_filter(post: &Value, topics: &HashSet<String>, hashtags: &HashSet<String>) -> bool {
+    if topics.is_empty() && hashtags.is_empty() {
+        return true;
+    }
+    let topic = post["topic_tag"].as_str().map(|t| t.trim().trim_start_matches('#').to_lowercase());
+    if topic.is_some_and(|t| topics.contains(&t)) {
         return true;
     }
     let text = post["text"].as_str().unwrap_or("");
-    let hashtags = text
-        .split('#')
+    text.split('#')
         .skip(1)
-        .map(|s| s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>().to_lowercase());
-    let topic = post["topic_tag"].as_str().map(|t| t.trim_start_matches('#').to_lowercase());
-    hashtags.chain(topic).any(|t| tags.contains(&t))
+        .map(|s| s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>().to_lowercase())
+        .any(|t| hashtags.contains(&t))
 }
 
 /// Map Clef category probabilities to (category, bad probability, action).
@@ -292,7 +295,8 @@ struct Monitor {
     hide_threshold: f64,
     review_threshold: f64,
     allowlist: HashSet<String>,
-    tags: HashSet<String>,
+    topics: HashSet<String>,
+    hashtags: HashSet<String>,
     extra_rules: String,
     clef_url: String,
     clef_token: String,
@@ -314,7 +318,8 @@ impl Monitor {
             hide_threshold: parsed("HIDE_THRESHOLD", "0.85"),
             review_threshold: parsed("REVIEW_THRESHOLD", "0.5"),
             allowlist: csv_set("ALLOWLIST"),
-            tags: csv_set("TAGS"),
+            topics: csv_set("TOPICS"),
+            hashtags: csv_set("HASHTAGS"),
             extra_rules: var("EXTRA_RULES", Some("")),
             clef_url: var("CLEF_URL", None),
             clef_token: var("CLEF_TOKEN", None),
@@ -470,7 +475,7 @@ impl Monitor {
     fn poll(&self) -> Result<(), String> {
         let since = now().saturating_sub(self.lookback).to_string();
         let posts = self.paged("me/threads", "posts", &[("fields", "id,text,timestamp,topic_tag"), ("since", &since)])?;
-        for post in posts.iter().filter(|p| matches_tags(p, &self.tags)) {
+        for post in posts.iter().filter(|p| matches_filter(p, &self.topics, &self.hashtags)) {
             let Some(post_id) = post["id"].as_str() else { continue };
             let replies = self.paged(
                 &format!("{post_id}/replies"),
@@ -500,11 +505,14 @@ impl Monitor {
     }
 
     fn run(mut self) {
-        let mut tags: Vec<_> = self.tags.iter().collect();
-        tags.sort();
+        let sorted = |s: &HashSet<String>| {
+            let mut v: Vec<_> = s.iter().cloned().collect();
+            v.sort();
+            v
+        };
         log(json!({
             "level": "info", "msg": "starting", "dry_run": self.dry_run, "interval": self.interval,
-            "tags": tags, "llm": !self.llm_url.is_empty() && !self.llm_model.is_empty(),
+            "topics": sorted(&self.topics), "hashtags": sorted(&self.hashtags), "llm": !self.llm_url.is_empty() && !self.llm_model.is_empty(),
         }));
         loop {
             self.maybe_refresh();
@@ -554,12 +562,16 @@ mod tests {
     }
 
     #[test]
-    fn tag_filter() {
-        let tags = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
-        assert!(matches_tags(&json!({"text": "hi"}), &tags(&[])));
-        assert!(matches_tags(&json!({"text": "hi", "topic_tag": "Homelab"}), &tags(&["homelab"])));
-        assert!(matches_tags(&json!({"text": "new post #K8s today"}), &tags(&["k8s", "golang"])));
-        assert!(!matches_tags(&json!({"text": "no tags", "topic_tag": "cooking"}), &tags(&["homelab"])));
+    fn post_filter() {
+        let set = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        let none = set(&[]);
+        assert!(matches_filter(&json!({"text": "hi"}), &none, &none));
+        assert!(matches_filter(&json!({"text": "hi", "topic_tag": "Home Lab"}), &set(&["home lab"]), &none));
+        assert!(matches_filter(&json!({"text": "new post #K8s today"}), &none, &set(&["k8s", "golang"])));
+        // A topic filter does not match a hashtag with the same word, and the other way round.
+        assert!(!matches_filter(&json!({"text": "#homelab"}), &set(&["homelab"]), &none));
+        assert!(!matches_filter(&json!({"text": "hi", "topic_tag": "homelab"}), &none, &set(&["homelab"])));
+        assert!(!matches_filter(&json!({"text": "no tags", "topic_tag": "cooking"}), &set(&["homelab"]), &none));
     }
 
     #[test]

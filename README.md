@@ -102,7 +102,8 @@ Without Docker: `cargo build --release && ./target/release/socialbtw`.
 | `DRY_RUN` | `true` | `false` to actually hide replies |
 | `HIDE_THRESHOLD` | `0.85` | P(bad) at or above this hides |
 | `REVIEW_THRESHOLD` | `0.5` | P(bad) at or above this escalates |
-| `TAGS` | empty | Comma-separated tags; only posts whose topic tag or a `#hashtag` in the text matches are monitored (case-insensitive, `#` optional). Empty: all posts |
+| `TOPICS` | empty | Comma-separated Threads topics (the topic shown in the post header, e.g. `Home Lab,Rust`); posts with one of these topics are monitored. Case-insensitive |
+| `HASHTAGS` | empty | Comma-separated hashtags (`#` optional); posts with one of these `#hashtags` in the text are monitored. Case-insensitive. With both `TOPICS` and `HASHTAGS` empty, all posts are monitored; with either set, a post matching either one is monitored |
 | `ALLOWLIST` | empty | Comma-separated usernames never touched |
 | `POLL_INTERVAL_SECONDS` | `300` | |
 | `LOOKBACK_DAYS` | `3` | How far back to read your posts. Each poll costs 1 call per post; keep it small if you post a lot |
