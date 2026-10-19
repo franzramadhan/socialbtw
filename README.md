@@ -61,7 +61,16 @@ histogram and the logs for a few days, tune the thresholds, then set
    ```
 
 The app stays in development mode; no app review is needed for your own
-account. The token is refreshed every 24 hours and stored in the database, so
+account.
+
+**Or register the token from the browser** instead of the steps above: set
+`THREADS_APP_ID`, `THREADS_APP_SECRET` and `OAUTH_REDIRECT_URI`, add the same
+redirect URI under the app's Threads settings (Redirect Callback URLs), and
+open `/oauth/start` on the app. It sends you to Threads to approve, takes the
+code on `/oauth/callback`, exchanges it for a long-lived token and stores it.
+`THREADS_ACCESS_TOKEN` is then optional. The redirect only happens in your
+browser, so the app can stay private (LAN or VPN); it needs HTTPS. Set
+`THREADS_USERNAME` so a token for any other account is rejected. The token is refreshed every 24 hours and stored in the database, so
 it does not expire while the app runs. Setting a different
 `THREADS_ACCESS_TOKEN` replaces the stored one.
 
@@ -104,7 +113,11 @@ Without Docker: `cargo build --release && ./target/release/socialbtw`.
 
 | Env | Default | |
 |-----|---------|---|
-| `THREADS_ACCESS_TOKEN` | required | Long-lived Threads token |
+| `THREADS_ACCESS_TOKEN` | required without OAuth | Long-lived Threads token |
+| `THREADS_APP_ID` | empty | Threads app ID; with the next two, enables `/oauth/start` and `/oauth/callback` |
+| `THREADS_APP_SECRET` | empty | Threads app secret |
+| `OAUTH_REDIRECT_URI` | empty | Public or private HTTPS URL that reaches `/oauth/callback`, registered in the app |
+| `THREADS_USERNAME` | empty | Only accept tokens for this account (recommended with OAuth) |
 | `CLEF_URL` | required | Clef endpoint: Cloudflare `.../ai/run/@cf/cloudflare/clef` or LiteLLM `.../v1/systemone` |
 | `CLEF_TOKEN` | required | Bearer token for `CLEF_URL` |
 | `CLEF_MODEL` | `clef` | `clef` (27B, more accurate) or `clef-flash` (9B, cheaper); behind LiteLLM, the `model_name` |
@@ -121,7 +134,7 @@ Without Docker: `cargo build --release && ./target/release/socialbtw`.
 | `POLL_INTERVAL_SECONDS` | `300` | |
 | `LOOKBACK_DAYS` | `3` | How far back to read your posts (reposts excluded). Each poll costs 1 call per own post; keep it small if you post a lot |
 | `DB_PATH` | `/data/socialbtw.db` in the image, `socialbtw.db` otherwise | SQLite file. Holds the refreshed token: keep it private |
-| `METRICS_PORT` | `9090` | Prometheus `/metrics` |
+| `METRICS_PORT` | `9090` | HTTP port: `/metrics`, and `/oauth/*` when OAuth is set. Expose only `/oauth/` |
 
 ## Observability
 

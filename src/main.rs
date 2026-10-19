@@ -7,7 +7,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Mutex;
@@ -100,17 +100,152 @@ impl Metrics {
     }
 }
 
-// ponytail: one-connection-at-a-time HTTP server, enough for a scraper every 30s.
-fn serve_metrics(port: u16) {
-    let listener = TcpListener::bind(("0.0.0.0", port)).unwrap_or_else(|e| fatal(&format!("metrics port {port}: {e}")));
+// ---- HTTP server: /metrics, and /oauth/* when OAuth is configured -----------
+
+/// Threads OAuth settings. With all of them set, /oauth/start and /oauth/callback
+/// register a new token from the browser.
+struct OAuth {
+    app_id: String,
+    app_secret: String,
+    redirect_uri: String,
+    /// Expected Threads account; a token for anyone else is rejected. Empty: any.
+    username: String,
+}
+
+impl OAuth {
+    fn from_env() -> Option<Self> {
+        let get = |k: &str| var(k, Some(""));
+        let (app_id, app_secret, redirect_uri) = (get("THREADS_APP_ID"), get("THREADS_APP_SECRET"), get("OAUTH_REDIRECT_URI"));
+        if app_id.is_empty() || app_secret.is_empty() || redirect_uri.is_empty() {
+            return None;
+        }
+        Some(OAuth { app_id, app_secret, redirect_uri, username: get("THREADS_USERNAME").trim_start_matches('@').into() })
+    }
+
+    fn authorize_url(&self, state: &str) -> String {
+        format!(
+            "https://threads.com/oauth/authorize?{}",
+            query(&[
+                ("client_id", &self.app_id),
+                ("redirect_uri", &self.redirect_uri),
+                ("scope", "threads_basic,threads_read_replies,threads_manage_replies"),
+                ("response_type", "code"),
+                ("state", state),
+            ])
+        )
+    }
+
+    /// Code -> short-lived token -> long-lived token (60 days), checked against
+    /// `username`, then stored where the poller and the daily refresh read it.
+    fn exchange(&self, code: &str, store: &Store, http: &Http) -> Result<String, String> {
+        let q = query(&[
+            ("client_id", &self.app_id),
+            ("client_secret", &self.app_secret),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", &self.redirect_uri),
+            ("code", code),
+        ]);
+        let short = http("oauth", "POST", &format!("https://graph.threads.net/oauth/access_token?{q}"), None, None)?;
+        let short = short["access_token"].as_str().ok_or("oauth: code exchange returned no access_token")?;
+        let q = query(&[("grant_type", "th_exchange_token"), ("client_secret", &self.app_secret), ("access_token", short)]);
+        let long = http("oauth", "GET", &format!("https://graph.threads.net/access_token?{q}"), None, None)?;
+        let (Some(token), Some(expires_in)) = (long["access_token"].as_str(), long["expires_in"].as_u64()) else {
+            return Err("oauth: long-lived exchange returned no access_token or expires_in".into());
+        };
+        let me = http("oauth", "GET", &format!("{THREADS_API}/me?{}", query(&[("fields", "id,username"), ("access_token", token)])), None, None)?;
+        let username = me["username"].as_str().unwrap_or("");
+        if !self.username.is_empty() && !username.eq_ignore_ascii_case(&self.username) {
+            return Err(format!("token is for @{username}, expected @{}; not stored", self.username));
+        }
+        let expires_at = now() + expires_in;
+        store.put("token", token);
+        store.put("expires_at", &expires_at.to_string());
+        metrics().token_expiry = expires_at;
+        log(json!({"level": "info", "msg": "token registered", "username": username, "expires_at": expires_at}));
+        Ok(format!("Token stored for @{username}, valid until {expires_at} (Unix time). From now on it is refreshed daily.\n"))
+    }
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut b = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .unwrap_or_else(|e| fatal(&format!("/dev/urandom: {e}")));
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%' && i + 2 < b.len())
+            .then(|| std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()))
+            .flatten();
+        match (b[i], hex) {
+            (_, Some(v)) => { out.push(v); i += 3; }
+            (b'+', _) => { out.push(b' '); i += 1; }
+            (c, _) => { out.push(c); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_query(q: &str) -> HashMap<String, String> {
+    q.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (decode(k), decode(v))).collect()
+}
+
+/// (status line, extra headers, body)
+type Response = (&'static str, String, String);
+
+// ponytail: one-connection-at-a-time HTTP server, enough for a scraper every 30s
+// and a human registering a token now and then.
+fn serve(port: u16, oauth: Option<OAuth>, db_path: String) {
+    let listener = TcpListener::bind(("0.0.0.0", port)).unwrap_or_else(|e| fatal(&format!("port {port}: {e}")));
     thread::spawn(move || {
+        // Own connection and HTTP client: neither is shared with the poller thread.
+        let store = oauth.as_ref().map(|_| Store::open(&db_path));
+        let http = real_http();
+        // OAuth `state` values handed out by /oauth/start, with their expiry.
+        let mut states: HashMap<String, u64> = HashMap::new();
         for mut stream in listener.incoming().flatten() {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let _ = stream.read(&mut [0u8; 1024]);
-            let body = metrics().render();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let target = req.split_whitespace().nth(1).unwrap_or("/");
+            let (path, q) = target.split_once('?').unwrap_or((target, ""));
+            let text = |status, body: String| -> Response { (status, "Content-Type: text/plain; charset=utf-8\r\n".into(), body) };
+            let (status, headers, body): Response = match (path, &oauth, &store) {
+                ("/metrics", _, _) => ("200 OK", "Content-Type: text/plain; version=0.0.4\r\n".into(), metrics().render()),
+                ("/oauth/start", Some(o), _) => {
+                    states.retain(|_, exp| *exp > now());
+                    let state = random_hex(16);
+                    let url = o.authorize_url(&state);
+                    states.insert(state, now() + 600);
+                    ("302 Found", format!("Location: {url}\r\n"), String::new())
+                }
+                ("/oauth/callback", Some(o), Some(store)) => {
+                    let p = parse_query(q);
+                    let state_ok = p.get("state").and_then(|s| states.remove(s)).is_some_and(|exp| exp > now());
+                    match (state_ok, p.get("code"), p.get("error_description").or(p.get("error"))) {
+                        (false, _, _) => text("400 Bad Request", "Unknown or expired state. Start again at /oauth/start.\n".into()),
+                        (_, _, Some(e)) => text("400 Bad Request", format!("Threads refused: {e}\n")),
+                        (_, None, _) => text("400 Bad Request", "No code in the callback.\n".into()),
+                        (_, Some(code), _) => match o.exchange(code.trim_end_matches("#_"), store, &http) {
+                            Ok(msg) => text("200 OK", msg),
+                            Err(e) => {
+                                log(json!({"level": "error", "msg": "token registration failed", "error": e}));
+                                text("502 Bad Gateway", format!("{e}\n"))
+                            }
+                        },
+                    }
+                }
+                _ => text("404 Not Found", "not found\n".into()),
+            };
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
         }
@@ -266,6 +401,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);",
         )
         .unwrap_or_else(|e| fatal(&format!("init {path}: {e}")));
+        // The poller and the OAuth callback each hold a connection.
+        let _ = db.busy_timeout(Duration::from_secs(5));
         Store(db)
     }
 
@@ -330,9 +467,10 @@ impl Monitor {
             next_refresh: 0,
         };
         // The token is refreshed daily and persisted, because it expires after 60 days.
-        // Changing THREADS_ACCESS_TOKEN replaces the stored token.
-        let seed = var("THREADS_ACCESS_TOKEN", None);
-        if m.store.get("seed").as_deref() != Some(&seed) {
+        // Changing THREADS_ACCESS_TOKEN replaces the stored token. It is optional
+        // when tokens are registered through /oauth/start instead.
+        let seed = var("THREADS_ACCESS_TOKEN", Some(""));
+        if !seed.is_empty() && m.store.get("seed").as_deref() != Some(&seed) {
             m.store.put("seed", &seed);
             m.store.put("token", &seed);
             m.store.put("expires_at", "0");
@@ -518,6 +656,11 @@ impl Monitor {
             "topics": sorted(&self.topics), "hashtags": sorted(&self.hashtags), "llm": !self.llm_url.is_empty() && !self.llm_model.is_empty(),
         }));
         loop {
+            if self.token().is_empty() {
+                log(json!({"level": "warning", "msg": "no Threads token: set THREADS_ACCESS_TOKEN or open /oauth/start"}));
+                thread::sleep(Duration::from_secs(self.interval));
+                continue;
+            }
             self.maybe_refresh();
             match self.poll() {
                 Ok(()) => metrics().last_poll = now(),
@@ -539,8 +682,14 @@ fn main() {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
-    serve_metrics(parsed("METRICS_PORT", "9090"));
-    Monitor::from_env(real_http()).run();
+    let oauth = OAuth::from_env();
+    let monitor = Monitor::from_env(real_http()); // creates the tables first
+    if oauth.is_none() && monitor.token().is_empty() {
+        fatal("set THREADS_ACCESS_TOKEN, or THREADS_APP_ID + THREADS_APP_SECRET + OAUTH_REDIRECT_URI");
+    }
+    log(json!({"level": "info", "msg": "http", "oauth": oauth.is_some()}));
+    serve(parsed("METRICS_PORT", "9090"), oauth, var("DB_PATH", Some("socialbtw.db")));
+    monitor.run();
 }
 
 #[cfg(test)]
@@ -582,6 +731,38 @@ mod tests {
         assert_eq!(parse_llm("```json\n{\"action\": \"hide\", \"reason\": \"promo\"}\n```"), ("hide".into(), "promo".into()));
         assert_eq!(parse_llm("{\"action\": \"delete\"}").0, "review");
         assert_eq!(parse_llm("no idea").0, "review");
+    }
+
+    #[test]
+    fn query_decoding() {
+        let p = parse_query("code=AQB%2Fx-y_z&state=ab12&error_description=Permissions+error");
+        assert_eq!(p["code"], "AQB/x-y_z");
+        assert_eq!(p["state"], "ab12");
+        assert_eq!(p["error_description"], "Permissions error");
+        assert_eq!(decode("100%"), "100%");
+        assert_eq!(random_hex(16).len(), 32);
+    }
+
+    #[test]
+    fn oauth_exchange() {
+        let fake = |username: &'static str| -> Http {
+            Box::new(move |_, _, url, _, _| {
+                Ok(if url.contains("/oauth/access_token") {
+                    json!({"access_token": "short", "user_id": 1})
+                } else if url.contains("th_exchange_token") {
+                    json!({"access_token": "long", "expires_in": 5_184_000})
+                } else {
+                    json!({"id": "1", "username": username})
+                })
+            })
+        };
+        let o = OAuth { app_id: "1".into(), app_secret: "s".into(), redirect_uri: "https://x/cb".into(), username: "franz".into() };
+        let store = Store::open(":memory:");
+        assert!(o.exchange("c", &store, &fake("someone_else")).is_err());
+        assert_eq!(store.get("token"), None);
+        assert!(o.exchange("c", &store, &fake("Franz")).unwrap().contains("@Franz"));
+        assert_eq!(store.get("token").as_deref(), Some("long"));
+        assert!(store.get("expires_at").unwrap().parse::<u64>().unwrap() > now());
     }
 
     // Runs every handle() case in one test: they share process env vars.
