@@ -75,7 +75,12 @@ impl Threads<'_> {
 
     /// Your posts since `since` (Unix seconds), reposts included.
     pub fn posts(&self, since: u64) -> Result<Vec<Value>, String> {
-        self.paged("me/threads", "posts", &[("fields", "id,text,timestamp,topic_tag,media_type"), ("since", &since.to_string())])
+        // limit=100 (default 25): fewer paging calls for accounts that post a lot
+        self.paged(
+            "me/threads",
+            "posts",
+            &[("fields", "id,text,timestamp,topic_tag,media_type"), ("since", &since.to_string()), ("limit", "100")],
+        )
     }
 
     /// Top-level replies to one post.
@@ -83,7 +88,7 @@ impl Threads<'_> {
         self.paged(
             &format!("{post_id}/replies"),
             "replies",
-            &[("fields", "id,text,username,permalink,timestamp,hide_status,is_reply_owned_by_me")],
+            &[("fields", "id,text,username,permalink,timestamp,hide_status,is_reply_owned_by_me"), ("limit", "100")],
         )
     }
 

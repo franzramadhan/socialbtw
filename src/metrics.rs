@@ -15,6 +15,8 @@ pub struct Metrics {
     pub post_checks: BTreeMap<&'static str, u64>,
     pub last_poll: u64,
     pub token_expiry: u64,
+    /// Polling paused after a rate limit until this time (0: never).
+    pub paused_until: u64,
 }
 
 static METRICS: Mutex<Metrics> = Mutex::new(Metrics {
@@ -26,6 +28,7 @@ static METRICS: Mutex<Metrics> = Mutex::new(Metrics {
     post_checks: BTreeMap::new(),
     last_poll: 0,
     token_expiry: 0,
+    paused_until: 0,
 });
 
 pub fn metrics() -> MutexGuard<'static, Metrics> {
@@ -67,8 +70,9 @@ impl Metrics {
         }
         s += &format!(
             "# TYPE threads_last_poll_success_timestamp_seconds gauge\nthreads_last_poll_success_timestamp_seconds {}\n\
-             # TYPE threads_token_expiry_timestamp_seconds gauge\nthreads_token_expiry_timestamp_seconds {}\n",
-            self.last_poll, self.token_expiry
+             # TYPE threads_token_expiry_timestamp_seconds gauge\nthreads_token_expiry_timestamp_seconds {}\n\
+             # TYPE threads_rate_limited_until_timestamp_seconds gauge\nthreads_rate_limited_until_timestamp_seconds {}\n",
+            self.last_poll, self.token_expiry, self.paused_until
         );
         s
     }
