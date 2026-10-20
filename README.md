@@ -23,7 +23,9 @@ skipped.
 flowchart TD
     R[New reply] --> S{Skip?<br/>own reply, allowlisted,<br/>no text, already decided,<br/>unhidden by you}
     S -- yes --> X[Ignore]
-    S -- no --> D{Same text as a<br/>hidden reply?}
+    S -- no --> P{Matches<br/>HIDE_PATTERN?}
+    P -- yes --> H
+    P -- no --> D{Same text as a<br/>hidden reply?}
     D -- yes --> H
     D -- no --> C["Stage 1: classifier<br/>P(bad) = hateful + harassment + spam + sexual"]
     C -- "P(bad) ≥ 0.85" --> H[Hide]
@@ -41,6 +43,10 @@ flowchart TD
   OpenAI-compatible chat model (`CLASSIFIER=chat`).
 - **Reviewer** (stage 2, only unclear replies): any OpenAI-compatible chat
   model, optional.
+- **Pattern** (no model call): a reply matching `HIDE_PATTERN`, a
+  case-insensitive regex, is hidden as `spam` (`stage=pattern`). For example
+  `gacor|slot\s*\d+|wa\.me/\d+|t\.me/`. Keep it to words that are never fine
+  in a reply: a match is hidden without review.
 - **Copypasta** (no model call): spam comes in waves of the same text. A reply
   whose text matches a hidden reply, ignoring case, spaces, punctuation and
   emoji, is hidden too (`stage=copypasta`). Texts under 20 letters and digits
@@ -148,6 +154,7 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | | Reviewer. Without it, unclear replies go to `review` |
 | `HIDE_THRESHOLD` | `0.85` | P(bad) that hides without review |
 | `REVIEW_THRESHOLD` | `0.5` | P(bad) that goes to the reviewer |
+| `HIDE_PATTERN` | | Case-insensitive regex that hides without the classifier |
 | `EXTRA_RULES` | | Your own policy for the chat prompts, e.g. `Mild swearing between friends is fine.` |
 | `DRY_RUN` | `true` | `false` to really hide |
 | **Which posts** | | |
@@ -158,6 +165,9 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 | `HASHTAGS` | | Only posts with one of these `#hashtags`. With `TOPICS`, either one matches |
 | `ALLOWLIST` | | Usernames never touched |
 | `STRIKE_LIMIT`, `STRIKE_WINDOW` | `3`, `30d` | Hidden replies by one author within the window that log `block_suggested`; `STRIKE_LIMIT=0` turns it off |
+| **Notifications** | | |
+| `NOTIFY_URL` | | Push `review` and `block_suggested`: an ntfy topic (`https://ntfy.sh/my-topic`) or `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>` |
+| `NOTIFY_TOKEN` | | ntfy access token, for a protected topic |
 | `MAX_POSTS_PER_POLL` | `50` | Posts whose replies are read per poll; 0 for no cap |
 | `RATE_LIMIT_BACKOFF`, `RATE_LIMIT_MAX_BACKOFF` | `15m`, `6h` | First and longest pause after a rate limit |
 | **Storage and runtime** | | |
@@ -172,7 +182,7 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 Each decision is a JSON log line (`msg=decision`) with the reply, `category`,
 `bad_probability`, `action` (`hidden`, `would_hide`, `kept`, `review`,
 `hide_pending`, `hide_failed`),
-`stage` (`classifier`, `reviewer` or `copypasta`), `reason` and `permalink`.
+`stage` (`classifier`, `reviewer`, `pattern` or `copypasta`), `reason` and `permalink`.
 `msg=unhidden` is a reply the app hid and you unhid, with its `bad_probability`.
 `msg=block_suggested` names an author to block, with `strikes` and `profile`.
 
@@ -192,7 +202,11 @@ Useful alerts: `increase(threads_replies_total{action="review"}[15m]) > 0`
 (needs you), `increase(threads_block_suggested_total[1h]) > 0` (someone to
 block), `time() - threads_last_poll_success_timestamp_seconds > 1800`
 (stuck), `threads_token_expiry_timestamp_seconds - time() < 7*86400` (refresh
-failing), `threads_rate_limited_until_timestamp_seconds > time()` (paused). For the reply text in a notification, alert on the logs instead.
+failing), `threads_rate_limited_until_timestamp_seconds > time()` (paused). For the
+reply text on your phone, set `NOTIFY_URL`. Notifications are best effort: a
+failed one is logged and counted in `threads_api_errors_total{endpoint="notify"}`,
+not retried. While the app is off, nothing is decided, so nothing is sent; the
+catch-up poll sends what came in meanwhile.
 
 ## Development
 
@@ -208,6 +222,7 @@ TEST_CHAT_URL=http://litellm:4000/v1 TEST_CHAT_MODEL=... cargo test live_chat  #
 | `monitor.rs` | poll loop and per-reply decisions |
 | `classifier.rs` | categories, `Classifier` trait, `systemone` and `chat`, thresholds |
 | `reviewer.rs`, `llm.rs` | stage 2, chat client |
+| `notify.rs` | ntfy and Telegram notifications |
 | `threads.rs`, `oauth.rs` | Threads API, token registration |
 | `server.rs`, `store.rs` | HTTP endpoints, SQLite or PostgreSQL |
 | `metrics.rs`, `http.rs`, `util.rs` | metrics, outbound HTTP, helpers |
