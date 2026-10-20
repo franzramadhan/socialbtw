@@ -4,10 +4,12 @@
 use crate::classifier::{self, decide, Classifier, Input, Probabilities};
 use crate::http::{is_client_error, is_rate_limited, Http};
 use crate::metrics::metrics;
+use crate::notify::Notifier;
 use crate::reviewer::Reviewer;
 use crate::store::{db_spec, Decision, Store};
 use crate::threads::{parse_ts, Threads};
 use crate::util::{csv_set, duration, fatal, log, now, parsed, var};
+use regex_lite::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::thread;
@@ -23,6 +25,8 @@ pub struct Monitor {
     lookback: u64,
     hide_threshold: f64,
     review_threshold: f64,
+    hide_pattern: Option<Regex>,
+    notifier: Option<Notifier>,
     allowlist: HashSet<String>,
     topics: HashSet<String>,
     hashtags: HashSet<String>,
@@ -54,6 +58,8 @@ impl Monitor {
             lookback: parsed::<u64>("LOOKBACK_DAYS", "3") * 86400,
             hide_threshold: parsed("HIDE_THRESHOLD", "0.85"),
             review_threshold: parsed("REVIEW_THRESHOLD", "0.5"),
+            hide_pattern: hide_pattern(&var("HIDE_PATTERN", Some(""))),
+            notifier: Notifier::from_env(),
             allowlist: csv_set("ALLOWLIST"),
             topics: csv_set("TOPICS"),
             hashtags: csv_set("HASHTAGS"),
@@ -84,13 +90,17 @@ impl Monitor {
         let username = reply["username"].as_str().unwrap_or("");
         let input = Input { post: post["text"].as_str().unwrap_or(""), reply: text, author: username };
 
-        // A copy of a reply that was already hidden is hidden without asking the classifier.
-        let copy_of = copy_key(text).and_then(|k| self.store.get(&k)).filter(|v| !v.is_empty());
-        let (category, bad_p, probs, stage, reason, action) = match copy_of {
-            Some(v) => {
+        // A HIDE_PATTERN match, or a copy of a reply that was already hidden, is
+        // hidden without asking the classifier.
+        let shortcut = match self.hide_pattern.as_ref().and_then(|p| p.find(text)) {
+            Some(m) => Some(("spam".to_string(), "pattern", format!("matched HIDE_PATTERN: {}", m.as_str()))),
+            None => copy_key(text).and_then(|k| self.store.get(&k)).filter(|v| !v.is_empty()).map(|v| {
                 let (category, original) = v.split_once(' ').unwrap_or((&v, ""));
-                (category.to_string(), 1.0, Probabilities::new(), "copypasta", format!("same text as hidden reply {original}"), "hide".to_string())
-            }
+                (category.to_string(), "copypasta", format!("same text as hidden reply {original}"))
+            }),
+        };
+        let (category, bad_p, probs, stage, reason, action) = match shortcut {
+            Some((category, stage, reason)) => (category, 1.0, Probabilities::new(), stage, reason, "hide".to_string()),
             None => {
                 let probs = self.classifier.classify(&self.http, &input)?;
                 let (category, bad_p, first) = decide(&probs, self.hide_threshold, self.review_threshold);
@@ -134,6 +144,10 @@ impl Monitor {
             "probabilities": probs, "action": action, "stage": stage, "reason": reason,
             "permalink": reply["permalink"].as_str().unwrap_or(""),
         }));
+        if action == "review" {
+            let message = format!("{text}\n\n{category}, P(bad) {bad_p:.2}{}", if reason.is_empty() { String::new() } else { format!(": {reason}") });
+            self.notify(&format!("Review reply by @{username}"), &message, reply["permalink"].as_str().unwrap_or(""));
+        }
         if matches!(action, "hidden" | "would_hide" | "hide_pending") {
             if let (Some(k), "classifier" | "reviewer") = (copy_key(text), stage) {
                 self.store.put(&k, &format!("{category} {id}"));
@@ -151,6 +165,12 @@ impl Monitor {
         }
     }
 
+    fn notify(&self, title: &str, message: &str, click: &str) {
+        if let Some(n) = &self.notifier {
+            n.send(&self.http, title, message, click);
+        }
+    }
+
     /// Threads has no block API: once an author has `strike_limit` hidden replies
     /// within `strike_window`, every further hide logs block_suggested, for you to block by hand.
     fn check_strikes(&self, username: &str, reply: &Value) {
@@ -165,6 +185,9 @@ impl Monitor {
                     "window_days": self.strike_window / 86400, "profile": format!("https://www.threads.com/@{username}"),
                     "permalink": reply["permalink"].as_str().unwrap_or(""),
                 }));
+                let days = self.strike_window / 86400;
+                let message = format!("{n} hidden replies in {days} days. Latest: {}", reply["text"].as_str().unwrap_or(""));
+                self.notify(&format!("Block @{username}?"), &message, &format!("https://www.threads.com/@{username}"));
             }
             Ok(_) => {}
             Err(e) => log(json!({"level": "warning", "msg": "strike count failed", "username": username, "error": e})),
@@ -360,6 +383,11 @@ fn select_due<'a>(posts: Vec<&'a Value>, next_check: &HashMap<String, u64>, now:
     (due, not_due, over)
 }
 
+/// HIDE_PATTERN as a case-insensitive regex; None when empty.
+fn hide_pattern(spec: &str) -> Option<Regex> {
+    (!spec.is_empty()).then(|| Regex::new(&format!("(?i){spec}")).unwrap_or_else(|e| fatal(&format!("invalid HIDE_PATTERN: {e}"))))
+}
+
 /// kv key for a reply's text without case, spaces, punctuation or emoji, so copies
 /// of a hidden reply match. None for short texts, which repeat innocently ("mantap kak").
 // ponytail: exact match after normalizing; a wave that varies one word gets past, fuzzy hashing if that happens.
@@ -487,7 +515,7 @@ mod tests {
             run(false, gray.clone(), Some("{\"action\": \"hide\", \"reason\": \"gambling promo\"}")),
             ("hidden".into(), vec!["classifier", "reviewer", "hide"])
         );
-        assert_eq!(run(false, gray, Some("no idea")), ("review".into(), vec!["classifier", "reviewer"]));
+        assert_eq!(run(false, gray.clone(), Some("no idea")), ("review".into(), vec!["classifier", "reviewer"]));
 
         // Rate-limited hide: saved as hide_pending, the poll is stopped, and the
         // retry hides it without classifying again.
@@ -526,6 +554,18 @@ mod tests {
         calls.borrow_mut().clear();
         m.handle(&post, &spam("c4", "slot gacor hari ini daftar di sini")).unwrap();
         assert_eq!(*calls.borrow(), vec!["classifier", "hide"]);
+
+        // HIDE_PATTERN hides without the classifier; a review is notified.
+        env::set_var("HIDE_PATTERN", r"gacor|wa\.me/\d+");
+        env::set_var("NOTIFY_URL", "https://ntfy.sh/btw");
+        let (m, calls) = setup(false, gray.clone(), None, None);
+        m.handle(&post, &spam("h1", "Slot GACOR")).unwrap();
+        assert_eq!(m.store.action("h1").as_deref(), Some("hidden"));
+        m.handle(&post, &spam("h2", "is this ok?")).unwrap();
+        assert_eq!(m.store.action("h2").as_deref(), Some("review"));
+        assert_eq!(*calls.borrow(), vec!["hide", "classifier", "notify"]);
+        env::remove_var("HIDE_PATTERN");
+        env::remove_var("NOTIFY_URL");
     }
 
     #[test]

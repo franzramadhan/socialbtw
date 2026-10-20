@@ -10,6 +10,7 @@ mod http;
 mod llm;
 mod metrics;
 mod monitor;
+mod notify;
 mod oauth;
 mod reviewer;
 mod server;
