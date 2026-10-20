@@ -2,7 +2,7 @@
 
 | Status | Date | PR | Release |
 |---|---|---|---|
-| implemented | 2026-10-20 | # | v0.6.0 |
+| implemented | 2026-10-20 | #4 | v0.6.0 |
 
 > Copies of a hidden reply are hidden without a model call, repeat offenders
 > are flagged for you to block, and replies you unhide are counted as false
