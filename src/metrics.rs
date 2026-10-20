@@ -13,6 +13,9 @@ pub struct Metrics {
     bad_sum: f64,
     pub api_errors: BTreeMap<&'static str, u64>,
     pub post_checks: BTreeMap<&'static str, u64>,
+    /// category -> replies the app hid and you unhid
+    pub unhidden: BTreeMap<String, u64>,
+    pub block_suggested: u64,
     pub last_poll: u64,
     pub token_expiry: u64,
     /// Polling paused after a rate limit until this time (0: never).
@@ -26,6 +29,8 @@ static METRICS: Mutex<Metrics> = Mutex::new(Metrics {
     bad_sum: 0.0,
     api_errors: BTreeMap::new(),
     post_checks: BTreeMap::new(),
+    unhidden: BTreeMap::new(),
+    block_suggested: 0,
     last_poll: 0,
     token_expiry: 0,
     paused_until: 0,
@@ -68,11 +73,16 @@ impl Metrics {
         for (r, v) in &self.post_checks {
             s += &format!("threads_post_checks_total{{result=\"{r}\"}} {v}\n");
         }
+        s += "# TYPE threads_unhidden_total counter\n";
+        for (c, v) in &self.unhidden {
+            s += &format!("threads_unhidden_total{{category=\"{c}\"}} {v}\n");
+        }
         s += &format!(
-            "# TYPE threads_last_poll_success_timestamp_seconds gauge\nthreads_last_poll_success_timestamp_seconds {}\n\
+            "# TYPE threads_block_suggested_total counter\nthreads_block_suggested_total {}\n\
+             # TYPE threads_last_poll_success_timestamp_seconds gauge\nthreads_last_poll_success_timestamp_seconds {}\n\
              # TYPE threads_token_expiry_timestamp_seconds gauge\nthreads_token_expiry_timestamp_seconds {}\n\
              # TYPE threads_rate_limited_until_timestamp_seconds gauge\nthreads_rate_limited_until_timestamp_seconds {}\n",
-            self.last_poll, self.token_expiry, self.paused_until
+            self.block_suggested, self.last_poll, self.token_expiry, self.paused_until
         );
         s
     }

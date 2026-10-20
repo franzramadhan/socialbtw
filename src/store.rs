@@ -38,6 +38,13 @@ pub struct PendingHide {
 const PENDING_SQL: &str = "SELECT id, post_id, username, text, category, bad_probability, stage, reason \
                            FROM replies WHERE action = 'hide_pending' ORDER BY decided_at";
 
+// Numbered placeholders work in both SQLite and PostgreSQL.
+const STRIKES_SQL: &str = "SELECT COUNT(*) FROM replies WHERE lower(username) = lower($1) \
+                           AND action IN ('hidden', 'would_hide', 'hide_pending') AND decided_at >= $2";
+
+const UNHIDE_SQL: &str = "UPDATE replies SET action = 'unhidden' WHERE id = $1 AND action = 'hidden' \
+                          RETURNING category, bad_probability";
+
 pub enum Store {
     Sqlite(Connection),
     Postgres { url: String, tls: tokio_postgres_rustls::MakeRustlsConnect, client: RefCell<Option<postgres::Client>> },
@@ -226,6 +233,25 @@ impl Store {
         }
     }
 
+    /// Replies by `username` hidden (or to be hidden) since `since` (Unix seconds).
+    pub fn strikes(&self, username: &str, since: u64) -> Result<u64, String> {
+        let since = since as i64;
+        let n: i64 = match self {
+            Store::Sqlite(db) => db.query_row(STRIKES_SQL, params![username, since], |r| r.get(0)).map_err(|e| format!("sqlite: {e}"))?,
+            Store::Postgres { .. } => self.pg(|c| c.query_one(STRIKES_SQL, &[&username, &since]).map(|r| r.get(0)))?,
+        };
+        Ok(n as u64)
+    }
+
+    /// Mark a reply the app hid as unhidden by you. Returns its category and
+    /// P(bad) the first time; None if it was not hidden by the app or is already marked.
+    pub fn unhide(&self, id: &str) -> Result<Option<(String, f64)>, String> {
+        match self {
+            Store::Sqlite(db) => db.query_row(UNHIDE_SQL, [id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| format!("sqlite: {e}")),
+            Store::Postgres { .. } => self.pg(|c| c.query_opt(UNHIDE_SQL, &[&id]).map(|r| r.map(|r| (r.get(0), r.get(1))))),
+        }
+    }
+
     #[cfg(test)]
     pub fn action(&self, id: &str) -> Option<String> {
         match self {
@@ -256,6 +282,14 @@ mod tests {
         assert_eq!((p.len(), p[0].id.as_str(), p[0].category.as_str()), (1, "r2", "spam"));
         store.set_action("r2", "hidden").unwrap();
         assert!(store.pending_hides().unwrap().is_empty());
+        // r1 and r2 are hidden; a kept reply is not a strike.
+        store.save(&Decision { id: "r3", username: "U", action: "kept", ..d }).unwrap();
+        assert_eq!(store.strikes("u", 0).unwrap(), 2);
+        assert_eq!(store.strikes("u", now() + 10).unwrap(), 0);
+        assert_eq!(store.unhide("r1").unwrap(), Some(("spam".into(), 0.9)));
+        assert_eq!(store.unhide("r1").unwrap(), None); // only once
+        assert_eq!(store.unhide("r3").unwrap(), None); // never hidden
+        assert_eq!(store.strikes("u", 0).unwrap(), 1);
     }
 
     // Needs a PostgreSQL server: TEST_DATABASE_URL=postgres://... (and DATABASE_CA_FILE
@@ -277,6 +311,10 @@ mod tests {
         assert!(store.pending_hides().unwrap().iter().any(|p| p.id == "pg-r2"));
         store.set_action("pg-r2", "hidden").unwrap();
         assert!(!store.pending_hides().unwrap().iter().any(|p| p.id == "pg-r2"));
+        assert!(store.strikes("U", 0).unwrap() >= 2);
+        store.set_action("pg-r1", "hidden").unwrap(); // an earlier run may have unhidden it
+        assert_eq!(store.unhide("pg-r1").unwrap().map(|(c, _)| c), Some("spam".into()));
+        assert_eq!(store.unhide("pg-r1").unwrap(), None);
         // Drop the first connection server-side, as a failover would.
         Store::open(&url)
             .pg(|c| c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database()", &[]))

@@ -1,7 +1,7 @@
 //! The poll loop: which posts to read, which replies are new, and what to do
 //! with each one.
 
-use crate::classifier::{self, decide, Classifier, Input};
+use crate::classifier::{self, decide, Classifier, Input, Probabilities};
 use crate::http::{is_client_error, is_rate_limited, Http};
 use crate::metrics::metrics;
 use crate::reviewer::Reviewer;
@@ -28,6 +28,8 @@ pub struct Monitor {
     hashtags: HashSet<String>,
     schedule: Vec<(u64, u64)>,
     max_posts_per_poll: usize,
+    strike_limit: u64,
+    strike_window: u64,
     min_backoff: u64,
     max_backoff: u64,
     /// Current pause after rate limits (0: none); doubles while they continue.
@@ -58,6 +60,8 @@ impl Monitor {
             schedule: parse_schedule(&var("POST_CHECK_SCHEDULE", Some("1d:5m,7d:1h,30d:6h")))
                 .unwrap_or_else(|| fatal("invalid POST_CHECK_SCHEDULE, expected like 1d:5m,7d:1h,30d:6h")),
             max_posts_per_poll: parsed("MAX_POSTS_PER_POLL", "50"),
+            strike_limit: parsed("STRIKE_LIMIT", "3"),
+            strike_window: duration(&var("STRIKE_WINDOW", Some("30d"))).unwrap_or_else(|| fatal("invalid STRIKE_WINDOW, expected like 30d")),
             min_backoff: duration(&var("RATE_LIMIT_BACKOFF", Some("15m"))).unwrap_or_else(|| fatal("invalid RATE_LIMIT_BACKOFF, expected like 15m")),
             max_backoff: duration(&var("RATE_LIMIT_MAX_BACKOFF", Some("6h"))).unwrap_or_else(|| fatal("invalid RATE_LIMIT_MAX_BACKOFF, expected like 6h")),
             backoff: 0,
@@ -80,19 +84,30 @@ impl Monitor {
         let username = reply["username"].as_str().unwrap_or("");
         let input = Input { post: post["text"].as_str().unwrap_or(""), reply: text, author: username };
 
-        let probs = self.classifier.classify(&self.http, &input)?;
-        let (category, bad_p, first) = decide(&probs, self.hide_threshold, self.review_threshold);
-        metrics().observe_bad(bad_p);
-        let (mut stage, mut reason, mut action) = ("classifier", String::new(), first.to_string());
-        if action == "escalate" {
-            match &self.reviewer {
-                Some(r) => {
-                    stage = "reviewer";
-                    (action, reason) = r.review(&self.http, &input, &probs)?;
-                }
-                None => action = "review".into(),
+        // A copy of a reply that was already hidden is hidden without asking the classifier.
+        let copy_of = copy_key(text).and_then(|k| self.store.get(&k)).filter(|v| !v.is_empty());
+        let (category, bad_p, probs, stage, reason, action) = match copy_of {
+            Some(v) => {
+                let (category, original) = v.split_once(' ').unwrap_or((&v, ""));
+                (category.to_string(), 1.0, Probabilities::new(), "copypasta", format!("same text as hidden reply {original}"), "hide".to_string())
             }
-        }
+            None => {
+                let probs = self.classifier.classify(&self.http, &input)?;
+                let (category, bad_p, first) = decide(&probs, self.hide_threshold, self.review_threshold);
+                metrics().observe_bad(bad_p);
+                let (mut stage, mut reason, mut action) = ("classifier", String::new(), first.to_string());
+                if action == "escalate" {
+                    match &self.reviewer {
+                        Some(r) => {
+                            stage = "reviewer";
+                            (action, reason) = r.review(&self.http, &input, &probs)?;
+                        }
+                        None => action = "review".into(),
+                    }
+                }
+                (category, bad_p, probs, stage, reason, action)
+            }
+        };
         // A failed hide is saved as hide_pending and retried on its own
         // (retry_pending_hides), so the reply is not classified and paid for again.
         let mut hide_error = None;
@@ -119,6 +134,12 @@ impl Monitor {
             "probabilities": probs, "action": action, "stage": stage, "reason": reason,
             "permalink": reply["permalink"].as_str().unwrap_or(""),
         }));
+        if matches!(action, "hidden" | "would_hide" | "hide_pending") {
+            if let (Some(k), "classifier" | "reviewer") = (copy_key(text), stage) {
+                self.store.put(&k, &format!("{category} {id}"));
+            }
+            self.check_strikes(username, reply);
+        }
         match hide_error {
             // Stops the poll, so the backoff starts.
             Some(e) if is_rate_limited(&e) => Err(e),
@@ -128,6 +149,44 @@ impl Monitor {
             }
             None => Ok(()),
         }
+    }
+
+    /// Threads has no block API: once an author has `strike_limit` hidden replies
+    /// within `strike_window`, every further hide logs block_suggested, for you to block by hand.
+    fn check_strikes(&self, username: &str, reply: &Value) {
+        if self.strike_limit == 0 || username.is_empty() {
+            return;
+        }
+        match self.store.strikes(username, now().saturating_sub(self.strike_window)) {
+            Ok(n) if n >= self.strike_limit => {
+                metrics().block_suggested += 1;
+                log(json!({
+                    "level": "warning", "msg": "block_suggested", "username": username, "strikes": n,
+                    "window_days": self.strike_window / 86400, "profile": format!("https://www.threads.com/@{username}"),
+                    "permalink": reply["permalink"].as_str().unwrap_or(""),
+                }));
+            }
+            Ok(_) => {}
+            Err(e) => log(json!({"level": "warning", "msg": "strike count failed", "username": username, "error": e})),
+        }
+    }
+
+    /// A reply the app hid and you unhid: count it (false positives, for tuning
+    /// the thresholds) and stop hiding copies of its text.
+    fn note_unhidden(&self, reply: &Value) -> Result<(), String> {
+        let Some(id) = reply["id"].as_str() else { return Ok(()) };
+        let Some((category, bad_p)) = self.store.unhide(id)? else { return Ok(()) };
+        let text = reply["text"].as_str().unwrap_or("");
+        if let Some(k) = copy_key(text) {
+            self.store.put(&k, "");
+        }
+        *metrics().unhidden.entry(category.clone()).or_default() += 1;
+        log(json!({
+            "level": "info", "msg": "unhidden", "reply_id": id, "username": reply["username"], "text": text,
+            "category": category, "bad_probability": (bad_p * 10000.0).round() / 10000.0,
+            "permalink": reply["permalink"].as_str().unwrap_or(""),
+        }));
+        Ok(())
     }
 
     /// Retry hides that failed earlier. A rate limit stops here; a 4xx (the reply
@@ -197,6 +256,9 @@ impl Monitor {
                 // (UNHUSHED) is never hidden again.
                 let username = reply["username"].as_str().unwrap_or("").to_lowercase();
                 let Some(reply_id) = reply["id"].as_str() else { continue };
+                if reply["hide_status"].as_str() == Some("UNHUSHED") {
+                    self.note_unhidden(reply)?;
+                }
                 // A database error stops the poll: otherwise every reply would look new
                 // and be paid for again.
                 if reply["is_reply_owned_by_me"].as_bool() == Some(true)
@@ -296,6 +358,14 @@ fn select_due<'a>(posts: Vec<&'a Value>, next_check: &HashMap<String, u64>, now:
     let over = if budget > 0 && due.len() > budget { due.len() - budget } else { 0 };
     due.truncate(due.len() - over);
     (due, not_due, over)
+}
+
+/// kv key for a reply's text without case, spaces, punctuation or emoji, so copies
+/// of a hidden reply match. None for short texts, which repeat innocently ("mantap kak").
+// ponytail: exact match after normalizing; a wave that varies one word gets past, fuzzy hashing if that happens.
+fn copy_key(text: &str) -> Option<String> {
+    let norm: String = text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect();
+    (norm.chars().count() >= 20).then(|| format!("copy:{norm}"))
 }
 
 /// The next pause after a rate limit: the minimum first, then doubling, capped.
@@ -437,5 +507,30 @@ mod tests {
         let m = Monitor { http: gone, ..m };
         m.retry_pending_hides().unwrap();
         assert_eq!(m.store.action("r1").as_deref(), Some("hide_failed"));
+
+        // Copypasta: a copy of a hidden reply is hidden without the classifier.
+        let (m, calls) = setup(false, json!({"spam": 0.99}), None, None);
+        let spam = |id: &str, text: &str| json!({"id": id, "text": text, "username": "x", "permalink": "p"});
+        m.handle(&post, &spam("c1", "Slot gacor hari ini, daftar di sini!")).unwrap();
+        m.handle(&post, &spam("c2", "slot GACOR hari ini 🔥 daftar di sini")).unwrap();
+        assert_eq!(m.store.action("c2").as_deref(), Some("hidden"));
+        assert_eq!(*calls.borrow(), vec!["classifier", "hide", "hide"]);
+        // Third strike for x within the window: block_suggested.
+        let before = metrics().block_suggested;
+        m.handle(&post, &spam("c3", "another long spam reply with a link")).unwrap();
+        assert_eq!(metrics().block_suggested, before + 1);
+        // You unhide c1: counted once, and its copies go to the classifier again.
+        m.note_unhidden(&json!({"id": "c1", "text": "Slot gacor hari ini, daftar di sini!", "hide_status": "UNHUSHED"})).unwrap();
+        assert_eq!(m.store.action("c1").as_deref(), Some("unhidden"));
+        assert!(m.store.unhide("c1").unwrap().is_none());
+        calls.borrow_mut().clear();
+        m.handle(&post, &spam("c4", "slot gacor hari ini daftar di sini")).unwrap();
+        assert_eq!(*calls.borrow(), vec!["classifier", "hide"]);
+    }
+
+    #[test]
+    fn copy_keys() {
+        assert_eq!(copy_key("Slot GACOR hari ini!! 🔥 daftar"), copy_key("slot gacor hari ini daftar"));
+        assert_eq!(copy_key("mantap kak 🔥"), None);
     }
 }
