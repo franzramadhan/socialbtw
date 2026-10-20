@@ -2,7 +2,7 @@
 
 | Status | Date | PR | Release |
 |---|---|---|---|
-| implemented | 2026-10-20 | # | v0.7.0 |
+| implemented | 2026-10-20 | #5 | v0.7.0 |
 
 > Replies that need you (`review`, `block_suggested`) are pushed to ntfy or
 > Telegram, and a regex you choose hides obvious spam without a model call.
