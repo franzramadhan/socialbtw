@@ -23,7 +23,9 @@ skipped.
 flowchart TD
     R[New reply] --> S{Skip?<br/>own reply, allowlisted,<br/>no text, already decided,<br/>unhidden by you}
     S -- yes --> X[Ignore]
-    S -- no --> C["Stage 1: classifier<br/>P(bad) = hateful + harassment + spam + sexual"]
+    S -- no --> D{Same text as a<br/>hidden reply?}
+    D -- yes --> H
+    D -- no --> C["Stage 1: classifier<br/>P(bad) = hateful + harassment + spam + sexual"]
     C -- "P(bad) ≥ 0.85" --> H[Hide]
     C -- "0.5 ≤ P(bad) < 0.85" --> V{Reviewer<br/>configured?}
     C -- "P(bad) < 0.5" --> K[Keep]
@@ -39,8 +41,17 @@ flowchart TD
   OpenAI-compatible chat model (`CLASSIFIER=chat`).
 - **Reviewer** (stage 2, only unclear replies): any OpenAI-compatible chat
   model, optional.
+- **Copypasta** (no model call): spam comes in waves of the same text. A reply
+  whose text matches a hidden reply, ignoring case, spaces, punctuation and
+  emoji, is hidden too (`stage=copypasta`). Texts under 20 letters and digits
+  never match.
 - Each reply is decided once. If you unhide a reply in Threads, it stays
-  unhidden.
+  unhidden, its copies are classified again, and it is logged as `unhidden`
+  so you can see what the app got wrong.
+- **Repeat offenders:** Threads has no block API. When one author has
+  `STRIKE_LIMIT` (3) hidden replies within `STRIKE_WINDOW` (30 days), each
+  further hide logs `block_suggested` with their profile link, so you can
+  block them by hand.
 - With `DRY_RUN=true` (the default), hides are only logged as `would_hide`.
   Replies decided during a dry run are not revisited.
 
@@ -146,6 +157,7 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 | `TOPICS` | | Only posts with one of these Threads topics (comma-separated) |
 | `HASHTAGS` | | Only posts with one of these `#hashtags`. With `TOPICS`, either one matches |
 | `ALLOWLIST` | | Usernames never touched |
+| `STRIKE_LIMIT`, `STRIKE_WINDOW` | `3`, `30d` | Hidden replies by one author within the window that log `block_suggested`; `STRIKE_LIMIT=0` turns it off |
 | `MAX_POSTS_PER_POLL` | `50` | Posts whose replies are read per poll; 0 for no cap |
 | `RATE_LIMIT_BACKOFF`, `RATE_LIMIT_MAX_BACKOFF` | `15m`, `6h` | First and longest pause after a rate limit |
 | **Storage and runtime** | | |
@@ -160,20 +172,25 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 Each decision is a JSON log line (`msg=decision`) with the reply, `category`,
 `bad_probability`, `action` (`hidden`, `would_hide`, `kept`, `review`,
 `hide_pending`, `hide_failed`),
-`stage` (`classifier` or `reviewer`), `reason` and `permalink`.
+`stage` (`classifier`, `reviewer` or `copypasta`), `reason` and `permalink`.
+`msg=unhidden` is a reply the app hid and you unhid, with its `bad_probability`.
+`msg=block_suggested` names an author to block, with `strikes` and `profile`.
 
 | Metric | |
 |---|---|
 | `threads_replies_total{category,action,stage}` | Decisions |
 | `threads_bad_probability` | Histogram of P(bad), for tuning thresholds |
 | `threads_post_checks_total{result}` | Posts read (`checked`), not due (`skipped`) or left for the next poll (`over_budget`) |
+| `threads_unhidden_total{category}` | Hidden by the app, unhidden by you (false positives) |
+| `threads_block_suggested_total` | Hides by authors over the strike limit |
 | `threads_api_errors_total{endpoint}` | Failed calls |
 | `threads_last_poll_success_timestamp_seconds` | Last good poll |
 | `threads_token_expiry_timestamp_seconds` | Token expiry |
 | `threads_rate_limited_until_timestamp_seconds` | End of the current rate-limit pause |
 
 Useful alerts: `increase(threads_replies_total{action="review"}[15m]) > 0`
-(needs you), `time() - threads_last_poll_success_timestamp_seconds > 1800`
+(needs you), `increase(threads_block_suggested_total[1h]) > 0` (someone to
+block), `time() - threads_last_poll_success_timestamp_seconds > 1800`
 (stuck), `threads_token_expiry_timestamp_seconds - time() < 7*86400` (refresh
 failing), `threads_rate_limited_until_timestamp_seconds > time()` (paused). For the reply text in a notification, alert on the logs instead.
 
