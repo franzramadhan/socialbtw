@@ -59,9 +59,12 @@ flowchart TD
   further hide logs `block_suggested` with their profile link, so you can
   block them by hand.
 - **Auto-reply:** `AUTO_REPLY` answers a reply as you, by its category, for
-  example `harassment=Please keep it civil.`. Only replies that stay visible
-  (`review` or `kept`) are answered: a hidden reply hides yours with it. One
-  answer per author per `AUTO_REPLY_COOLDOWN` (1 day).
+  example `harassment=Please keep it civil.`. With a reviewer configured, the
+  model adapts that answer to the reply and its language; otherwise it is
+  used as is. By default (`AUTO_REPLY_MODE=draft`) the answer is pushed to
+  `NOTIFY_URL` for you to post; `AUTO_REPLY_MODE=post` posts it. Only replies
+  that stay visible (`review` or `kept`) are answered: a hidden reply hides
+  yours with it. One answer per author per `AUTO_REPLY_COOLDOWN` (1 day).
 - With `DRY_RUN=true` (the default), hides are only logged as `would_hide`.
   Replies decided during a dry run are not revisited.
 
@@ -161,6 +164,7 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 | `REVIEW_THRESHOLD` | `0.5` | P(bad) that goes to the reviewer |
 | `HIDE_PATTERN` | | Case-insensitive regex that hides without the classifier |
 | `AUTO_REPLY` | | Answer visible replies by category, `\|`-separated: `harassment=Please keep it civil.\|sexual=Not here.` |
+| `AUTO_REPLY_MODE` | `draft` | `draft`: push the answer to `NOTIFY_URL`. `post`: post it as you |
 | `AUTO_REPLY_COOLDOWN` | `1d` | At most one answer per author within this time |
 | `EXTRA_RULES` | | Your own policy for the chat prompts, e.g. `Mild swearing between friends is fine.` |
 | `DRY_RUN` | `true` | `false` to really hide |
@@ -192,8 +196,8 @@ Each decision is a JSON log line (`msg=decision`) with the reply, `category`,
 `stage` (`classifier`, `reviewer`, `pattern` or `copypasta`), `reason` and `permalink`.
 `msg=unhidden` is a reply the app hid and you unhid, with its `bad_probability`.
 `msg=block_suggested` names an author to block, with `strikes` and `profile`.
-`msg=auto_reply` is an answer, with `result` (`replied`, `would_reply`,
-`cooldown` or `failed`).
+`msg=auto_reply` is an answer, with `source` (`llm` or `static`) and `result`
+(`drafted`, `replied`, `would_reply`, `cooldown` or `failed`).
 
 | Metric | |
 |---|---|
