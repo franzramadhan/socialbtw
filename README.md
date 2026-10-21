@@ -58,6 +58,10 @@ flowchart TD
   `STRIKE_LIMIT` (3) hidden replies within `STRIKE_WINDOW` (30 days), each
   further hide logs `block_suggested` with their profile link, so you can
   block them by hand.
+- **Auto-reply:** `AUTO_REPLY` answers a reply as you, by its category, for
+  example `harassment=Please keep it civil.`. Only replies that stay visible
+  (`review` or `kept`) are answered: a hidden reply hides yours with it. One
+  answer per author per `AUTO_REPLY_COOLDOWN` (1 day).
 - With `DRY_RUN=true` (the default), hides are only logged as `would_hide`.
   Replies decided during a dry run are not revisited.
 
@@ -89,7 +93,8 @@ reply again. If the reply is gone (another 4xx), it becomes `hide_failed`.
 
 **1. Meta app.** At <https://developers.facebook.com/apps>, create an app with
 the **Access the Threads API** use case. Add the permissions `threads_basic`,
-`threads_read_replies` and `threads_manage_replies`. Under App roles, add your
+`threads_read_replies` and `threads_manage_replies` (and
+`threads_content_publish` for `AUTO_REPLY`). Under App roles, add your
 account as a **Threads Tester** and accept the invite in Threads (Settings >
 Account > Website permissions). Development mode is enough; no app review.
 
@@ -155,6 +160,8 @@ Check the `would_hide` decisions for a few days, then set `DRY_RUN=false`.
 | `HIDE_THRESHOLD` | `0.85` | P(bad) that hides without review |
 | `REVIEW_THRESHOLD` | `0.5` | P(bad) that goes to the reviewer |
 | `HIDE_PATTERN` | | Case-insensitive regex that hides without the classifier |
+| `AUTO_REPLY` | | Answer visible replies by category, `\|`-separated: `harassment=Please keep it civil.\|sexual=Not here.` |
+| `AUTO_REPLY_COOLDOWN` | `1d` | At most one answer per author within this time |
 | `EXTRA_RULES` | | Your own policy for the chat prompts, e.g. `Mild swearing between friends is fine.` |
 | `DRY_RUN` | `true` | `false` to really hide |
 | **Which posts** | | |
@@ -185,6 +192,8 @@ Each decision is a JSON log line (`msg=decision`) with the reply, `category`,
 `stage` (`classifier`, `reviewer`, `pattern` or `copypasta`), `reason` and `permalink`.
 `msg=unhidden` is a reply the app hid and you unhid, with its `bad_probability`.
 `msg=block_suggested` names an author to block, with `strikes` and `profile`.
+`msg=auto_reply` is an answer, with `result` (`replied`, `would_reply`,
+`cooldown` or `failed`).
 
 | Metric | |
 |---|---|

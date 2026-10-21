@@ -27,6 +27,9 @@ pub struct Monitor {
     review_threshold: f64,
     hide_pattern: Option<Regex>,
     notifier: Option<Notifier>,
+    /// category -> your answer to a reply that stays visible
+    auto_reply: HashMap<String, String>,
+    auto_reply_cooldown: u64,
     allowlist: HashSet<String>,
     topics: HashSet<String>,
     hashtags: HashSet<String>,
@@ -60,6 +63,10 @@ impl Monitor {
             review_threshold: parsed("REVIEW_THRESHOLD", "0.5"),
             hide_pattern: hide_pattern(&var("HIDE_PATTERN", Some(""))),
             notifier: Notifier::from_env(),
+            auto_reply: parse_auto_reply(&var("AUTO_REPLY", Some("")))
+                .unwrap_or_else(|| fatal("invalid AUTO_REPLY, expected like harassment=Please keep it civil.|sexual=...")),
+            auto_reply_cooldown: duration(&var("AUTO_REPLY_COOLDOWN", Some("1d")))
+                .unwrap_or_else(|| fatal("invalid AUTO_REPLY_COOLDOWN, expected like 1d")),
             allowlist: csv_set("ALLOWLIST"),
             topics: csv_set("TOPICS"),
             hashtags: csv_set("HASHTAGS"),
@@ -144,6 +151,10 @@ impl Monitor {
             "probabilities": probs, "action": action, "stage": stage, "reason": reason,
             "permalink": reply["permalink"].as_str().unwrap_or(""),
         }));
+        // Only a reply that stays visible gets an answer: yours would be hidden with it.
+        if let (Some(answer), "review" | "kept") = (self.auto_reply.get(&category), action) {
+            self.answer(id, username, answer);
+        }
         if action == "review" {
             let message = format!("{text}\n\n{category}, P(bad) {bad_p:.2}{}", if reason.is_empty() { String::new() } else { format!(": {reason}") });
             self.notify(&format!("Review reply by @{username}"), &message, reply["permalink"].as_str().unwrap_or(""));
@@ -163,6 +174,31 @@ impl Monitor {
             }
             None => Ok(()),
         }
+    }
+
+    /// AUTO_REPLY: answer as you, at most once per author per AUTO_REPLY_COOLDOWN.
+    /// Runs after the decision is saved, so it is never sent twice; a failure is
+    /// logged and not retried.
+    fn answer(&self, reply_id: &str, username: &str, text: &str) {
+        let key = format!("answered:{}", username.to_lowercase());
+        let last: u64 = self.store.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let (result, error) = if now() < last + self.auto_reply_cooldown {
+            ("cooldown", None)
+        } else if self.dry_run {
+            ("would_reply", None)
+        } else {
+            match self.threads().reply(reply_id, text) {
+                Ok(()) => {
+                    self.store.put(&key, &now().to_string());
+                    ("replied", None)
+                }
+                Err(e) => ("failed", Some(e)),
+            }
+        };
+        log(json!({
+            "level": if error.is_some() { "warning" } else { "info" }, "msg": "auto_reply",
+            "reply_id": reply_id, "username": username, "text": text, "result": result, "error": error,
+        }));
     }
 
     fn notify(&self, title: &str, message: &str, click: &str) {
@@ -388,6 +424,19 @@ fn hide_pattern(spec: &str) -> Option<Regex> {
     (!spec.is_empty()).then(|| Regex::new(&format!("(?i){spec}")).unwrap_or_else(|e| fatal(&format!("invalid HIDE_PATTERN: {e}"))))
 }
 
+/// "harassment=Please keep it civil.|sexual=..." -> category -> answer.
+/// None for an unknown category or an empty answer.
+fn parse_auto_reply(spec: &str) -> Option<HashMap<String, String>> {
+    spec.split('|')
+        .filter(|e| !e.trim().is_empty())
+        .map(|e| {
+            let (c, t) = e.split_once('=')?;
+            let (c, t) = (c.trim().to_lowercase(), t.trim());
+            (classifier::CATEGORIES.iter().any(|(k, _)| *k == c) && !t.is_empty()).then(|| (c, t.to_string()))
+        })
+        .collect()
+}
+
 /// kv key for a reply's text without case, spaces, punctuation or emoji, so copies
 /// of a hidden reply match. None for short texts, which repeat innocently ("mantap kak").
 // ponytail: exact match after normalizing; a wave that varies one word gets past, fuzzy hashing if that happens.
@@ -482,6 +531,7 @@ mod tests {
                 Ok(match endpoint {
                     "classifier" => json!({"result": {"answers": {"category": {"probabilities": probs}}}}),
                     "reviewer" => json!({"choices": [{"message": {"content": verdict_text.clone().unwrap_or_default()}}]}),
+                    "reply" => json!({"id": "container"}),
                     _ => json!({"success": true}),
                 })
             });
@@ -566,6 +616,33 @@ mod tests {
         assert_eq!(*calls.borrow(), vec!["hide", "classifier", "notify"]);
         env::remove_var("HIDE_PATTERN");
         env::remove_var("NOTIFY_URL");
+
+        // AUTO_REPLY answers a visible reply once per author; a hidden one gets no answer.
+        env::set_var("AUTO_REPLY", "harassment=Please keep it civil.");
+        let rude = json!({"harassment": 0.6, "neutral": 0.4});
+        let (m, calls) = setup(false, rude.clone(), None, None);
+        m.handle(&post, &spam("a1", "you are an idiot")).unwrap();
+        m.handle(&post, &spam("a2", "still an idiot")).unwrap();
+        assert_eq!(m.store.action("a2").as_deref(), Some("review"));
+        assert_eq!(*calls.borrow(), vec!["classifier", "reply", "reply", "classifier"]);
+        let (m, calls) = setup(false, json!({"harassment": 0.99}), None, None);
+        m.handle(&post, &spam("a3", "you are an idiot")).unwrap();
+        assert_eq!(*calls.borrow(), vec!["classifier", "hide"]);
+        let (m, calls) = setup(true, rude, None, None);
+        m.handle(&post, &spam("a4", "you are an idiot")).unwrap();
+        assert_eq!(*calls.borrow(), vec!["classifier"]);
+        env::remove_var("AUTO_REPLY");
+    }
+
+    #[test]
+    fn auto_reply_spec() {
+        let m = parse_auto_reply(" harassment = Please keep it civil. | Sexual=Not here.|").unwrap();
+        assert_eq!(m["harassment"], "Please keep it civil.");
+        assert_eq!(m["sexual"], "Not here.");
+        assert!(parse_auto_reply("").unwrap().is_empty());
+        assert!(parse_auto_reply("review=hi").is_none());
+        assert!(parse_auto_reply("spam=").is_none());
+        assert!(parse_auto_reply("no equals sign").is_none());
     }
 
     #[test]

@@ -33,7 +33,7 @@ impl OAuth {
             query(&[
                 ("client_id", &self.app_id),
                 ("redirect_uri", &self.redirect_uri),
-                ("scope", "threads_basic,threads_read_replies,threads_manage_replies"),
+                ("scope", "threads_basic,threads_read_replies,threads_manage_replies,threads_content_publish"),
                 ("response_type", "code"),
                 ("state", state),
             ])
