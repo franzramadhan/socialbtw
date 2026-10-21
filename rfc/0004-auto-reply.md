@@ -2,7 +2,7 @@
 
 | Status | Date | PR | Release |
 |---|---|---|---|
-| draft | 2026-10-21 | | v0.8.0 |
+| draft | 2026-10-21 | #6 | v0.8.0 |
 
 > A reply that stays visible can get an answer from you, chosen by its
 > category, such as "Please keep it civil." for borderline harassment.
