@@ -61,7 +61,9 @@ flowchart TD
 - **Auto-reply:** `AUTO_REPLY` answers a reply as you, by its category, for
   example `harassment=Please keep it civil.`. With a reviewer configured, the
   model adapts that answer to the reply and its language; otherwise it is
-  used as is. By default (`AUTO_REPLY_MODE=draft`) the answer is pushed to
+  used as is. A draft with a link, `@` or `#`, a `HIDE_PATTERN` match, or that
+  the classifier finds bad or spam falls back to your answer, against prompt
+  injection in the reply. By default (`AUTO_REPLY_MODE=draft`) the answer is pushed to
   `NOTIFY_URL` for you to post; `AUTO_REPLY_MODE=post` posts it. Only replies
   that stay visible (`review` or `kept`) are answered: a hidden reply hides
   yours with it. One answer per author per `AUTO_REPLY_COOLDOWN` (1 day).

@@ -196,7 +196,10 @@ impl Monitor {
             ("cooldown", None)
         } else {
             match self.reviewer.as_ref().map(|r| r.draft(&self.http, input, base)) {
-                Some(Ok(t)) => (text, source) = (t, "llm"),
+                Some(Ok(t)) => match self.check_draft(input, &t) {
+                    Ok(()) => (text, source) = (t, "llm"),
+                    Err(e) => draft_error = Some(e),
+                },
                 Some(Err(e)) => draft_error = Some(e),
                 None => {}
             }
@@ -221,6 +224,20 @@ impl Monitor {
             "reply_id": reply_id, "username": input.author, "answer": text, "source": source,
             "result": result, "error": error, "draft_error": draft_error,
         }));
+    }
+
+    /// Guards against prompt injection in the reply: a drafted answer must pass
+    /// your own filters, HIDE_PATTERN and the classifier (not bad, not spam).
+    fn check_draft(&self, input: &Input, draft: &str) -> Result<(), String> {
+        if let Some(m) = self.hide_pattern.as_ref().and_then(|p| p.find(draft)) {
+            return Err(format!("draft matches HIDE_PATTERN: {}", m.as_str()));
+        }
+        let probs = self.classifier.classify(&self.http, &Input { post: input.post, reply: draft, author: "" })?;
+        let (category, bad_p, _) = decide(&probs, self.hide_threshold, self.review_threshold);
+        if category == "spam" || bad_p >= self.review_threshold {
+            return Err(format!("draft classified {category}, P(bad) {bad_p:.2}: {draft}"));
+        }
+        Ok(())
     }
 
     fn notify(&self, title: &str, message: &str, click: &str) {
@@ -655,10 +672,22 @@ mod tests {
         let (m, calls) = setup(true, rude, None, None);
         m.handle(&post, &spam("a4", "you are an idiot")).unwrap();
         assert_eq!(*calls.borrow(), vec!["classifier"]);
-        // With a reviewer, the model drafts the answer.
+        // With a reviewer, the model drafts the answer, and the classifier checks
+        // the draft: here it finds it as bad as the reply, so the base answer is posted.
         let (m, calls) = setup(false, json!({"harassment": 0.6, "neutral": 0.4}), Some("{\"action\": \"keep\"}"), None);
         m.handle(&post, &spam("a5", "you are an idiot")).unwrap();
-        assert_eq!(*calls.borrow(), vec!["classifier", "reviewer", "drafter", "reply", "reply"]);
+        assert_eq!(*calls.borrow(), vec!["classifier", "reviewer", "drafter", "classifier", "reply", "reply"]);
+        let input = Input { post: "post", reply: "you are an idiot", author: "x" };
+        assert!(m.check_draft(&input, "Santai aja kak").is_err());
+        let (m, _) = setup(false, json!({"neutral": 0.9, "spam": 0.1}), None, None);
+        assert!(m.check_draft(&input, "Santai aja kak").is_ok());
+        let (m, _) = setup(false, json!({"spam": 0.4, "neutral": 0.3, "positive": 0.3}), None, None);
+        assert!(m.check_draft(&input, "Santai aja kak").is_err());
+        env::set_var("HIDE_PATTERN", r"wa\.me");
+        let (m, calls) = setup(false, json!({"neutral": 0.9}), None, None);
+        assert!(m.check_draft(&input, "chat me at WA.me/62812").is_err());
+        assert!(calls.borrow().is_empty());
+        env::remove_var("HIDE_PATTERN");
         // Draft mode: the answer is pushed to you, not posted, also in a dry run.
         env::set_var("AUTO_REPLY_MODE", "draft");
         env::set_var("NOTIFY_URL", "https://ntfy.sh/btw");
