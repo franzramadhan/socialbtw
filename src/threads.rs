@@ -1,4 +1,5 @@
-//! Threads API: the access token, reading posts and replies, hiding replies.
+//! Threads API: the access token, reading posts and replies, hiding and
+//! answering replies.
 
 use crate::http::Http;
 use crate::metrics::metrics;
@@ -95,6 +96,14 @@ impl Threads<'_> {
     /// Hide a top-level reply (and everything nested under it).
     pub fn hide(&self, reply_id: &str) -> Result<(), String> {
         self.call("POST", &format!("{reply_id}/manage_reply"), "hide", &[("hide", "true")]).map(|_| ())
+    }
+
+    /// Answer a reply as you: create a text container, then publish it.
+    /// Needs the threads_content_publish permission.
+    pub fn reply(&self, reply_to_id: &str, text: &str) -> Result<(), String> {
+        let created = self.call("POST", "me/threads", "reply", &[("media_type", "TEXT"), ("text", text), ("reply_to_id", reply_to_id)])?;
+        let id = created["id"].as_str().ok_or("reply: response without id")?;
+        self.call("POST", "me/threads_publish", "reply", &[("creation_id", id)]).map(|_| ())
     }
 }
 
